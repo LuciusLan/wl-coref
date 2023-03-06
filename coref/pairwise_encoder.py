@@ -112,7 +112,8 @@ class PairwiseEncoderChunk(torch.nn.Module):
                 doc: Doc,
                 chunks_pos) -> torch.Tensor:
         #word_ids = torch.arange(0, len(doc["cased_words"]), device=self.device)
-        speaker_map = torch.tensor(self._speaker_map(doc, chunks_pos), device=self.device)
+        #speaker_map = torch.tensor(self._speaker_map(doc, chunks_pos), device=self.device)
+        speaker_map = self._speaker_map(doc, chunks_pos).clone().to(self.device)
         
         same_speaker = (speaker_map[top_indices] == speaker_map.unsqueeze(1))
         same_speaker = self.speaker_emb(same_speaker.to(torch.long))
@@ -133,7 +134,7 @@ class PairwiseEncoderChunk(torch.nn.Module):
         return self.dropout(torch.cat((same_speaker, distance, genre), dim=2))
 
     @staticmethod
-    def _speaker_map(doc: Doc, chunks_pos) -> List[int]:
+    def _speaker_map(doc: Doc, chunks_pos) -> torch.Tensor:
         """
         Returns a tensor where i-th element is the speaker id of i-th word.
         """

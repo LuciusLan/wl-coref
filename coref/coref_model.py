@@ -229,9 +229,10 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         prev_bound = 0
         for i, e in enumerate(doc["conll_bound"]):
             if e == 1:
-                chunks.append(torch.cat([words[prev_bound], words[i], torch.nn.functional.avg_pool1d(words[prev_bound:i+1].transpose(0, 1), i-prev_bound+1).squeeze(1)]))
-                chunks_pos.append([prev_bound, i])
-            prev_bound = i
+                if i - prev_bound > 1:
+                    chunks.append(torch.cat([words[prev_bound], words[i], torch.nn.functional.avg_pool1d(words[prev_bound:i+1].transpose(0, 1), i-prev_bound+1).squeeze(1)]))
+                    chunks_pos.append([prev_bound, i])
+                prev_bound = i
         chunks = torch.stack(chunks)
         top_rough_scores, top_indices = self.rough_scorer(words)
         top_rough_scores_chunk, top_indices_chunk = self.rough_scorer_chunk(chunks)
@@ -280,6 +281,8 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
 
         res.coref_y = self._get_ground_truth(
             cluster_ids, top_indices, (top_rough_scores > float("-inf")))
+        
+        # TODO: clustering for chunks
         res.word_clusters = self._clusterize(doc, res.coref_scores,
                                              top_indices)
         res.span_scores, res.span_y = self.sp.get_training_data(doc, words)
