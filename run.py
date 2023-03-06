@@ -77,6 +77,7 @@ if __name__ == "__main__":
 
     if args.batch_size:
         model.config.a_scoring_batch_size = args.batch_size
+    model.config.a_scoring_batch_size = 256
 
     if args.mode == "train":
         if args.weights is not None or args.warm_start:
