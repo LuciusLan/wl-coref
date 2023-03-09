@@ -13,15 +13,16 @@ import toml
 import torch
 from tqdm import tqdm   # type: ignore
 import transformers     # type: ignore
+import json
 
 from coref import bert, conll, utils
-from coref.anaphoricity_scorer import AnaphoricityScorer
+from coref.anaphoricity_scorer import AnaphoricityScorer, AnaphoricityScorerChunk
 from coref.cluster_checker import ClusterChecker
 from coref.config import Config
 from coref.const import CorefResult, Doc
 from coref.loss import CorefLoss
-from coref.pairwise_encoder import PairwiseEncoder
-from coref.rough_scorer import RoughScorer
+from coref.pairwise_encoder import PairwiseEncoder, PairwiseEncoderChunk
+from coref.rough_scorer import RoughScorer, RoughScorerChunk
 from coref.span_predictor import SpanPredictor
 from coref.tokenizer_customization import TOKENIZER_FILTERS, TOKENIZER_MAPS
 from coref.utils import GraphNode
@@ -69,6 +70,8 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         self._set_training(False)
         self._coref_criterion = CorefLoss(self.config.bce_loss_weight)
         self._span_criterion = torch.nn.CrossEntropyLoss(reduction="sum")
+
+        #self._tokenize_docs('data/english_test_head.jsonlines', 'test')
 
     @property
     def training(self) -> bool:
@@ -154,6 +157,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                     f" p: {s_lea[1]:.5f},"
                     f" r: {s_lea[2]:<.5f}"
                 )
+                torch.cuda.empty_cache()
             print()
 
         return (running_loss / len(docs), *s_checker.total_lea)
@@ -220,14 +224,28 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         # Obtain bilinear scores and leave only top-k antecedents for each word
         # top_rough_scores  [n_words, n_ants]
         # top_indices       [n_words, n_ants]
+        chunks = []
+        chunks_pos = []
+        prev_bound = 0
+        for i, e in enumerate(doc["conll_bound"]):
+            if e == 1:
+                if i - prev_bound > 1:
+                    chunks.append(torch.cat([words[prev_bound], words[i], torch.nn.functional.avg_pool1d(words[prev_bound:i+1].transpose(0, 1), i-prev_bound+1).squeeze(1)]))
+                    chunks_pos.append([prev_bound, i])
+                prev_bound = i
+        chunks = torch.stack(chunks)
         top_rough_scores, top_indices = self.rough_scorer(words)
+        top_rough_scores_chunk, top_indices_chunk = self.rough_scorer_chunk(chunks)
 
         # Get pairwise features [n_words, n_ants, n_pw_features]
         pw = self.pw(top_indices, doc)
+        pw_chunks = self.pw_chunk(top_indices_chunk, doc, chunks_pos)
 
         batch_size = self.config.a_scoring_batch_size
         a_scores_lst: List[torch.Tensor] = []
-
+        a_scores_chunk_lst = []
+        if len(chunks) > 1500:
+            print()
         for i in range(0, len(words), batch_size):
             pw_batch = pw[i:i + batch_size]
             words_batch = words[i:i + batch_size]
@@ -241,6 +259,20 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                 top_rough_scores_batch=top_rough_scores_batch
             )
             a_scores_lst.append(a_scores_batch)
+        
+        for i in range(0, len(chunks), batch_size):
+            pw_batch = pw_chunks[i:i + batch_size]
+            words_batch = chunks[i:i + batch_size]
+            top_indices_batch = top_indices_chunk[i:i + batch_size]
+            top_rough_scores_batch = top_rough_scores_chunk[i:i + batch_size]
+
+            # a_scores_batch    [batch_size, n_ants]
+            a_scores_batch = self.a_scorer_chunk(
+                all_mentions=chunks, mentions_batch=words_batch,
+                pw_batch=pw_batch, top_indices_batch=top_indices_batch,
+                top_rough_scores_batch=top_rough_scores_batch
+            )
+            a_scores_chunk_lst.append(a_scores_batch)
 
         res = CorefResult()
 
@@ -249,6 +281,8 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
 
         res.coref_y = self._get_ground_truth(
             cluster_ids, top_indices, (top_rough_scores > float("-inf")))
+        
+        # TODO: clustering for chunks
         res.word_clusters = self._clusterize(doc, res.coref_scores,
                                              top_indices)
         res.span_scores, res.span_y = self.sp.get_training_data(doc, words)
@@ -267,7 +301,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         to_save.extend(self.schedulers.items())
 
         time = datetime.strftime(datetime.now(), "%Y.%m.%d_%H.%M")
-        path = os.path.join(self.config.data_dir,
+        path = os.path.join("chunk"+self.config.data_dir,
                             f"{self.config.section}"
                             f"_(e{self.epochs_trained}_{time}).pt")
         savedict = {name: module.state_dict() for name, module in to_save}
@@ -287,7 +321,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
             running_c_loss = 0.0
             running_s_loss = 0.0
             random.shuffle(docs_ids)
-            pbar = tqdm(docs_ids, unit="docs", ncols=0)
+            pbar = tqdm(docs_ids, unit="docs", ncols=0, total=len(docs))
             for doc_id in pbar:
                 doc = docs[doc_id]
 
@@ -322,6 +356,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                     f" c_loss: {running_c_loss / (pbar.n + 1):<.5f}"
                     f" s_loss: {running_s_loss / (pbar.n + 1):<.5f}"
                 )
+                torch.cuda.empty_cache()
 
             self.epochs_trained += 1
             self.save_weights()
@@ -357,14 +392,18 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
     def _build_model(self):
         self.bert, self.tokenizer = bert.load_bert(self.config)
         self.pw = PairwiseEncoder(self.config).to(self.config.device)
+        self.pw_chunk = PairwiseEncoderChunk(self.config).to(self.config.device)
 
         bert_emb = self.bert.config.hidden_size
         pair_emb = bert_emb * 3 + self.pw.shape
+        pair_emb_chunk = bert_emb * 9 + self.pw.shape
 
         # pylint: disable=line-too-long
         self.a_scorer = AnaphoricityScorer(pair_emb, self.config).to(self.config.device)
+        self.a_scorer_chunk = AnaphoricityScorerChunk(pair_emb_chunk, self.config).to(self.config.device)
         self.we = WordEncoder(bert_emb, self.config).to(self.config.device)
         self.rough_scorer = RoughScorer(bert_emb, self.config).to(self.config.device)
+        self.rough_scorer_chunk = RoughScorerChunk(bert_emb*3, self.config).to(self.config.device)
         self.sp = SpanPredictor(bert_emb, self.config.sp_embedding_size).to(self.config.device)
 
         self.trainable: Dict[str, torch.nn.Module] = {
@@ -412,7 +451,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
     def _clusterize(self, doc: Doc, scores: torch.Tensor, top_indices: torch.Tensor):
         antecedents = scores.argmax(dim=1) - 1
         not_dummy = antecedents >= 0
-        coref_span_heads = torch.arange(0, len(scores))[not_dummy]
+        coref_span_heads = torch.arange(0, len(scores), device="cuda")[not_dummy]
         antecedents = top_indices[coref_span_heads, antecedents[not_dummy]]
 
         nodes = [GraphNode(i) for i in range(len(doc["cased_words"]))]
@@ -439,13 +478,30 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
             basename = os.path.basename(path)
             model_name = self.config.bert_model.replace("/", "_")
             cache_filename = f"{model_name}_{basename}.pickle"
-            if os.path.exists(cache_filename):
+            if "train" in basename:
+                cache_name = "train_tokenized_w_chunks.pt"
+            elif "development" in basename:
+                cache_name = "dev_tokenized_w_chunks.pt"
+            elif "test" in basename:
+                cache_name = "test_tokenized_w_chunks.pt"
+            """if os.path.exists(cache_filename):
                 with open(cache_filename, mode="rb") as cache_f:
                     self._docs[path] = pickle.load(cache_f)
             else:
                 self._docs[path] = self._tokenize_docs(path)
                 with open(cache_filename, mode="wb") as cache_f:
-                    pickle.dump(self._docs[path], cache_f)
+                    pickle.dump(self._docs[path], cache_f)"""
+            if os.path.exists(cache_name):
+                with open(cache_name, mode="rb") as cache_f:
+                    self._docs[path] = pickle.load(cache_f)
+            for doc_num,_ in enumerate(self._docs[path]):
+                if "\'" in self._docs[path][doc_num]['cased_words'] or "\'s" in self._docs[path][doc_num]['cased_words']:
+                    for i, e in enumerate(self._docs[path][doc_num]['cased_words']):
+                        if (e == "\'s" or e == "\'") and (self._docs[path][doc_num]["conll_bound"][i-1] == 1 \
+                                                          and self._docs[path][doc_num]["conll_bound"][i] == 0):
+                            self._docs[path][doc_num]["conll_bound"][i-1] = 0
+                            self._docs[path][doc_num]["conll_bound"][i] = 1
+                            
         return self._docs[path]
 
     @staticmethod
