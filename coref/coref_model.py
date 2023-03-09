@@ -346,14 +346,13 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
 
         # Obtain bert output for selected batches only
         attention_mask = (subwords_batches != self.tokenizer.pad_token_id)
-        out, _ = self.bert(
+        out = self.bert(
             subwords_batches_tensor,
             attention_mask=torch.tensor(
                 attention_mask, device=self.config.device))
-        del _
 
         # [n_subwords, bert_emb]
-        return out[subword_mask_tensor]
+        return out[0][subword_mask_tensor]
 
     def _build_model(self):
         self.bert, self.tokenizer = bert.load_bert(self.config)
