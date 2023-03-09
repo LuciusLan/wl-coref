@@ -5,6 +5,7 @@ import os
 import pickle
 import random
 import re
+import itertools
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np      # type: ignore
@@ -244,9 +245,8 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         batch_size = self.config.a_scoring_batch_size
         a_scores_lst: List[torch.Tensor] = []
         a_scores_chunk_lst = []
-        if len(chunks) > 1500:
-            print()
-        for i in range(0, len(words), batch_size):
+
+        """for i in range(0, len(words), batch_size):
             pw_batch = pw[i:i + batch_size]
             words_batch = words[i:i + batch_size]
             top_indices_batch = top_indices[i:i + batch_size]
@@ -258,7 +258,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                 pw_batch=pw_batch, top_indices_batch=top_indices_batch,
                 top_rough_scores_batch=top_rough_scores_batch
             )
-            a_scores_lst.append(a_scores_batch)
+            a_scores_lst.append(a_scores_batch)"""
         
         for i in range(0, len(chunks), batch_size):
             pw_batch = pw_chunks[i:i + batch_size]
@@ -474,6 +474,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         return sorted(clusters)
 
     def _get_docs(self, path: str) -> List[Doc]:
+        special_pronoun_list = ['his', 'their', 'its', 'my', 'your', 'her', 'our']
         if path not in self._docs:
             basename = os.path.basename(path)
             model_name = self.config.bert_model.replace("/", "_")
@@ -494,14 +495,34 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
             if os.path.exists(cache_name):
                 with open(cache_name, mode="rb") as cache_f:
                     self._docs[path] = pickle.load(cache_f)
-            for doc_num,_ in enumerate(self._docs[path]):
+            for doc_num, item in tqdm(enumerate(self._docs[path]), total=len(self._docs[path]), desc="Processing extra chunks"):
+                self._docs[path][doc_num]["extra_chunk"] = []
                 if "\'" in self._docs[path][doc_num]['cased_words'] or "\'s" in self._docs[path][doc_num]['cased_words']:
                     for i, e in enumerate(self._docs[path][doc_num]['cased_words']):
                         if (e == "\'s" or e == "\'") and (self._docs[path][doc_num]["conll_bound"][i-1] == 1 \
                                                           and self._docs[path][doc_num]["conll_bound"][i] == 0):
                             self._docs[path][doc_num]["conll_bound"][i-1] = 0
                             self._docs[path][doc_num]["conll_bound"][i] = 1
-                            
+                conll_chunk_boundary = []
+                temp_chunk = []
+                for i, bound in enumerate(item['conll_bound']):
+                    if i == 0:
+                        temp_chunk.append(i)
+                        continue        
+                    if bound == 1:
+                        temp_chunk.append(i)
+                        conll_chunk_boundary.append(temp_chunk)
+                        temp_chunk = []
+                    elif bound == 0:
+                        temp_chunk.append(i)
+                conll_chunk_boundary = [[e[0],e[-1]+1] for e in conll_chunk_boundary]
+                for chunk in conll_chunk_boundary:
+                    chunk_text = [e.lower() for e in item['cased_words'][chunk[0]:chunk[1]]]
+                    for pronoun in special_pronoun_list:
+                        if pronoun in chunk_text and chunk[1] - chunk[0] > 1:
+                            for i, e in enumerate(chunk_text):
+                                if pronoun == e:
+                                    self._docs[path][doc_num]['extra_chunk'].append([chunk[0]+i, chunk[0]+i+1])             
         return self._docs[path]
 
     @staticmethod
