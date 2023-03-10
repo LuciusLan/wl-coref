@@ -220,26 +220,45 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         # words           [n_words, span_emb]
         # cluster_ids     [n_words]
         words, cluster_ids = self.we(doc, self._bertify(doc))
-
+        #words, _ = self.we(doc, self._bertify(doc))
         # Obtain bilinear scores and leave only top-k antecedents for each word
         # top_rough_scores  [n_words, n_ants]
         # top_indices       [n_words, n_ants]
         chunks = []
         chunks_pos = []
+        start_pos = []
         prev_bound = 0
         for i, e in enumerate(doc["conll_bound"]):
             if e == 1:
-                if i - prev_bound > 1:
-                    chunks.append(torch.cat([words[prev_bound], words[i], torch.nn.functional.avg_pool1d(words[prev_bound:i+1].transpose(0, 1), i-prev_bound+1).squeeze(1)]))
-                    chunks_pos.append([prev_bound, i])
+                chunks.append(torch.cat([words[prev_bound], words[i], torch.nn.functional.avg_pool1d(words[prev_bound:i+1].transpose(0, 1), i-prev_bound+1).squeeze(1)]))
+                chunks_pos.append([prev_bound, i])
+                start_pos.append(prev_bound)
                 prev_bound = i
+        for i, pos in enumerate(doc["extra_chunks"]):
+            chunks.append(words[pos[0]].tile(3))
+            chunks_pos.append(pos)
+            start_pos.append(pos[0])
         chunks = torch.stack(chunks)
+
+        cluster_ids_chunk = []
+        for i, cluster in enumerate(doc['span_clusters']):
+            cluster_ids_chunk.append([0]*(len(doc['chunk_list'])+len(doc['extra_chunks'])))
+            for span in cluster:
+                for ic, chunk in enumerate(doc['chunk_list']):
+                    if chunk[0] >= span[0] and chunk[1] <= span[1]:
+                        cluster_ids_chunk[-1][ic] = i+1
+                for ic, chunk in enumerate(doc['extra_chunks']):
+                    if chunk[0] >= span[0] and chunk[1] <= span[1]:
+                        cluster_ids_chunk[-1][ic+len(doc['chunk_list'])] = i+1
+        cluster_ids_chunk = torch.LongTensor(cluster_ids_chunk).to(self.config.device)
+
+        start_pos = torch.LongTensor(start_pos).to(self.config.device)
         top_rough_scores, top_indices = self.rough_scorer(words)
         top_rough_scores_chunk, top_indices_chunk = self.rough_scorer_chunk(chunks)
 
         # Get pairwise features [n_words, n_ants, n_pw_features]
         pw = self.pw(top_indices, doc)
-        pw_chunks = self.pw_chunk(top_indices_chunk, doc, chunks_pos)
+        pw_chunks = self.pw_chunk(top_indices_chunk, doc, chunks_pos, start_pos)
 
         batch_size = self.config.a_scoring_batch_size
         a_scores_lst: List[torch.Tensor] = []
@@ -260,6 +279,9 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
             )
             a_scores_lst.append(a_scores_batch)
         
+        res = CorefResult()
+
+        # coref_scores  [n_spans, n_ants]
         for i in range(0, len(chunks), batch_size):
             pw_batch = pw_chunks[i:i + batch_size]
             words_batch = chunks[i:i + batch_size]
@@ -273,11 +295,10 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                 top_rough_scores_batch=top_rough_scores_batch
             )
             a_scores_chunk_lst.append(a_scores_batch)
-
-        res = CorefResult()
-
-        # coref_scores  [n_spans, n_ants]
+            
         res.coref_scores = torch.cat(a_scores_lst, dim=0)
+
+        res.coref_scores_chunk = torch.cat(a_scores_chunk_lst, dim=0)
 
         res.coref_y = self._get_ground_truth(
             cluster_ids, top_indices, (top_rough_scores > float("-inf")))
@@ -285,6 +306,11 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         # TODO: clustering for chunks
         res.word_clusters = self._clusterize(doc, res.coref_scores,
                                              top_indices)
+        
+        res.coref_y = self._get_ground_truth_chunk(
+            cluster_ids_chunk, top_indices_chunk, chunks_pos, (top_rough_scores_chunk > float("-inf")))
+        res.word_clusters = self._clusterize_chunk(doc, res.coref_scores_chunk,
+                                             top_indices_chunk)
         res.span_scores, res.span_y = self.sp.get_training_data(doc, words)
 
         if not self.training:
@@ -473,7 +499,33 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                 clusters.append(sorted(cluster))
         return sorted(clusters)
 
+    def _clusterize_chunk(self, doc: Doc, scores: torch.Tensor, top_indices: torch.Tensor):
+        antecedents = scores.argmax(dim=1) - 1
+        not_dummy = antecedents >= 0
+        coref_span_heads = torch.arange(0, len(scores), device="cuda")[not_dummy]
+        antecedents = top_indices[coref_span_heads, antecedents[not_dummy]]
+
+        nodes = [GraphNode(i) for i in range(len(doc["chunk_list"])+len(doc["extra_chunks"]))]
+        for i, j in zip(coref_span_heads.tolist(), antecedents.tolist()):
+            nodes[i].link(nodes[j])
+            assert nodes[i] is not nodes[j]
+
+        clusters = []
+        for node in nodes:
+            if len(node.links) > 0 and not node.visited:
+                cluster = []
+                stack = [node]
+                while stack:
+                    current_node = stack.pop()
+                    current_node.visited = True
+                    cluster.append(current_node.id)
+                    stack.extend(link for link in current_node.links if not link.visited)
+                assert len(cluster) > 1
+                clusters.append(sorted(cluster))
+        return sorted(clusters)
+
     def _get_docs(self, path: str) -> List[Doc]:
+        special_pronoun_list = ['his', 'their', 'its', 'my', 'your', 'her', 'our']
         if path not in self._docs:
             basename = os.path.basename(path)
             model_name = self.config.bert_model.replace("/", "_")
@@ -494,14 +546,38 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
             if os.path.exists(cache_name):
                 with open(cache_name, mode="rb") as cache_f:
                     self._docs[path] = pickle.load(cache_f)
-            for doc_num,_ in enumerate(self._docs[path]):
+            for doc_num, item in tqdm(enumerate(self._docs[path]), total=len(self._docs[path]), desc="procssing extra chunks"):
+                self._docs[path][doc_num]['extra_chunks'] = []
                 if "\'" in self._docs[path][doc_num]['cased_words'] or "\'s" in self._docs[path][doc_num]['cased_words']:
                     for i, e in enumerate(self._docs[path][doc_num]['cased_words']):
                         if (e == "\'s" or e == "\'") and (self._docs[path][doc_num]["conll_bound"][i-1] == 1 \
                                                           and self._docs[path][doc_num]["conll_bound"][i] == 0):
                             self._docs[path][doc_num]["conll_bound"][i-1] = 0
                             self._docs[path][doc_num]["conll_bound"][i] = 1
-                            
+                temp_chunk = []
+                conll_chunk_boundary = []
+                for i, bound in enumerate(item['conll_bound']):
+                    if i == 0:
+                        temp_chunk.append(i)
+                        continue        
+                    if bound == 1:
+                        temp_chunk.append(i)
+                        conll_chunk_boundary.append(temp_chunk)
+                        temp_chunk = []
+                    elif bound == 0:
+                        temp_chunk.append(i)
+                conll_chunk_boundary = [[e[0], e[-1]+1] for e in conll_chunk_boundary]
+                self._docs[path][doc_num]['chunk_list'] = conll_chunk_boundary
+                for chunk in conll_chunk_boundary:
+                    if chunk[1] - chunk[0] == 1:
+                        continue
+                    chunk_text = item['cased_words'][chunk[0]:chunk[1]]
+                    chunk_text = [c.lower() for c in chunk_text]
+                    for pronoun in special_pronoun_list:
+                        if pronoun in chunk_text:
+                            for i, e in enumerate(chunk_text):
+                                if pronoun == e:
+                                    self._docs[path][doc_num]["extra_chunks"].append([chunk[0]+i,chunk[0]+i+1])
         return self._docs[path]
 
     @staticmethod
@@ -526,6 +602,36 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         y[y == 0] = -1                                 # -1 for non-gold words
         y = utils.add_dummy(y)                         # [n_words, n_cands + 1]
         y = (y == cluster_ids.unsqueeze(1))            # True if coreferent
+        # For all rows with no gold antecedents setting dummy to True
+        y[y.sum(dim=1) == 0, 0] = True
+        return y.to(torch.float)
+
+    @staticmethod
+    def _get_ground_truth_chunk(cluster_ids: torch.Tensor,
+                          top_indices: torch.Tensor,
+                          chunk_pos,
+                          valid_pair_map: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            cluster_ids: tensor of shape [n_words], containing cluster indices
+                for each word. Non-gold words have cluster id of zero.
+            top_indices: tensor of shape [n_words, n_ants],
+                indices of antecedents of each word
+            valid_pair_map: boolean tensor of shape [n_words, n_ants],
+                whether for pair at [i, j] (i-th word and j-th word)
+                j < i is True
+
+        Returns:
+            tensor of shape [n_words, n_ants + 1] (dummy added),
+                containing 1 at position [i, j] if i-th and j-th words corefer.
+        """
+        y = torch.zeros_like(top_indices)
+        for row in cluster_ids:
+            y += row[top_indices] * valid_pair_map
+        #y = cluster_ids[top_indices] * valid_pair_map  # [n_words, n_ants]
+        y[y == 0] = -1                                 # -1 for non-gold words
+        y = utils.add_dummy(y)                         # [n_words, n_cands + 1]
+        y = (y == cluster_ids.sum(0).unsqueeze(1))            # True if coreferent
         # For all rows with no gold antecedents setting dummy to True
         y[y.sum(dim=1) == 0, 0] = True
         return y.to(torch.float)
