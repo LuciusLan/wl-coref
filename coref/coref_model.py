@@ -356,7 +356,8 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
 
                 res = self.run(doc)
 
-                c_loss = self._coref_criterion(res.coref_scores, res.coref_y)
+                #c_loss = self._coref_criterion(res.coref_scores, res.coref_y)
+                c_loss = self._coref_criterion(res.coref_scores_chunk, res.coref_y)
                 if res.span_y:
                     s_loss = (self._span_criterion(res.span_scores[:, :, 0], res.span_y[0])
                               + self._span_criterion(res.span_scores[:, :, 1], res.span_y[1])) / avg_spans / 2
@@ -559,7 +560,10 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                 for i, bound in enumerate(item['conll_bound']):
                     if i == 0:
                         temp_chunk.append(i)
-                        continue        
+                        if bound == 1:
+                            conll_chunk_boundary.append(temp_chunk)
+                            temp_chunk = []
+                        continue
                     if bound == 1:
                         temp_chunk.append(i)
                         conll_chunk_boundary.append(temp_chunk)
@@ -578,6 +582,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                             for i, e in enumerate(chunk_text):
                                 if pronoun == e:
                                     self._docs[path][doc_num]["extra_chunks"].append([chunk[0]+i,chunk[0]+i+1])
+                assert len(self._docs[path][doc_num]["chunk_list"]) == self._docs[path][doc_num]["conll_bound"].count(1)
         return self._docs[path]
 
     @staticmethod
