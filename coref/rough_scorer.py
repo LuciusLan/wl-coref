@@ -39,7 +39,8 @@ class RoughScorer(torch.nn.Module):
 
         rough_scores = pair_mask + bilinear_scores
 
-        return self._prune(rough_scores)
+        #return self._prune(rough_scores)
+        return rough_scores
 
     def _prune(self,
                rough_scores: torch.Tensor
@@ -73,7 +74,7 @@ class RoughScorerChunk(torch.nn.Module):
 
         self.k = config.rough_k
 
-    def forward(self,  # type: ignore  # pylint: disable=arguments-differ  #35566 in pytorch
+    '''def forward(self,  # type: ignore  # pylint: disable=arguments-differ  #35566 in pytorch
                 mentions: torch.Tensor,
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -90,7 +91,34 @@ class RoughScorerChunk(torch.nn.Module):
 
         rough_scores = pair_mask + bilinear_scores
 
+
         return self._prune(rough_scores)
+        #return rough_scores'''
+
+    def forward(self,  # type: ignore  # pylint: disable=arguments-differ  #35566 in pytorch
+                input1: torch.Tensor,
+                input2: torch.Tensor,
+                is_one2n: bool,
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns rough anaphoricity scores for candidates, which consist of
+        the bilinear output of the current model summed with mention scores.
+        """
+        # [n_mentions, n_mentions]
+        bilinear_scores = self.dropout(self.bilinear(input1)).mm(input2.T)
+
+        if is_one2n:
+            pair_mask = torch.zeros_like(bilinear_scores)
+        else:
+            pair_mask = torch.arange(input1.shape[0])
+            pair_mask = pair_mask.unsqueeze(1) - pair_mask.unsqueeze(0)
+            pair_mask = torch.log((pair_mask > 0).to(torch.float))
+            pair_mask = pair_mask.to(input1.device)
+
+        rough_scores = pair_mask + bilinear_scores
+
+        #return self._prune(rough_scores)
+        return rough_scores
 
     def _prune(self,
                rough_scores: torch.Tensor

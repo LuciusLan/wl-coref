@@ -226,48 +226,65 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         # Obtain bilinear scores and leave only top-k antecedents for each word
         # top_rough_scores  [n_words, n_ants]
         # top_indices       [n_words, n_ants]
-        chunks = []
-        chunks_pos = []
-        start_pos = []
+        single_chunks = []
+        single_words = []
         non_single = []
+        single_pos = []
+        nonsingle_pos = []
+
         for i, (s, e) in enumerate(doc["chunk_list"]):
-            chunks.append(torch.cat([words[s], words[e-1], torch.nn.functional.avg_pool1d(words[s:e].transpose(0, 1), e-s).squeeze(1)]))
-            chunks_pos.append([s, e])
-            start_pos.append(s)
-            non_single.append(e-s>1)
+            chunk_rep = torch.cat([words[s], words[e-1], torch.einsum('ij->i',words[s:e].transpose(0,1))/(e-s)])
+            if e-s == 1:
+                single_chunks.append(words[s].tile(3))
+                single_words.append(words[s])
+                single_pos.append([s,e])
+            else:
+                non_single.append(chunk_rep)
+                nonsingle_pos.append([s,e])
+
         for i, pos in enumerate(doc["extra_chunks"]):
-            chunks.append(words[pos[0]].tile(3))
-            chunks_pos.append(pos)
-            start_pos.append(pos[0])
-            non_single.append(False)
-        chunks = torch.stack(chunks)
+            single_chunks.append(words[pos[0]].tile(3))
+            single_words.append(words[pos[0]])
+            single_pos.append(pos)
+        single_chunks = torch.stack(single_chunks)
+        single_words = torch.stack(single_words)
+        non_single = torch.stack(non_single)
+        chunks = torch.cat([single_chunks, non_single], 0)
+        chunk_pos = single_pos
+        chunk_pos.extend(nonsingle_pos)
+        chunk_pos = torch.tensor(chunk_pos, dtype=torch.long, device=self.config.device)
+        start_pos = chunk_pos[:, 0]
 
 
         cluster_ids_chunk = torch.LongTensor(doc['cluster_ids_chunk']).to(self.config.device)
         if cluster_ids_chunk.size(0) == 0:
             cluster_ids_chunk = torch.zeros(chunks.size(0), dtype=torch.long, device=self.config.device).unsqueeze(0)
 
-        start_pos = torch.LongTensor(start_pos).to(self.config.device)
-        #top_rough_scores, top_indices = self.rough_scorer(words)
-        top_rough_scores_chunk, top_indices_chunk = self.rough_scorer_chunk(chunks)
-
+        #top_rough_scores, top_indices = self.rough_scorer(single_chunks)
+        #top_rough_scores_chunk, top_indices_chunk = self.rough_scorer_chunk(chunks)
+        one2one_scores = self.rough_scorer(single_words)
+        one2n_scores = self.rough_scorer_chunk(single_chunks, non_single, is_one2n=True)
+        n2n_scores = self.rough_scorer_chunk(non_single, non_single, is_one2n=False)
+        n2one_scores = torch.log(torch.zeros_like(one2n_scores.T))
+        top_rough_scores = torch.cat((torch.cat((one2one_scores, n2one_scores), 0), torch.cat((one2n_scores, n2n_scores), 0)), 1)
+        top_rough_scores, top_indices = self.rough_scorer._prune(top_rough_scores)
         # Get pairwise features [n_words, n_ants, n_pw_features]
-        #pw = self.pw(top_indices, doc)
-        pw_chunks = self.pw_chunk(top_indices_chunk, doc, chunks_pos, start_pos)
+        pw_chunks = self.pw_chunk(top_indices, doc, chunk_pos, start_pos)
+        #pw_chunks = self.pw_chunk(top_indices_chunk, doc, chunks_pos, start_pos)
 
         batch_size = self.config.a_scoring_batch_size
         #a_scores_lst: List[torch.Tensor] = []
         a_scores_chunk_lst = []
 
-        """for i in range(0, len(words), batch_size):
+        """for i in range(0, len(single_chunks), batch_size):
             pw_batch = pw[i:i + batch_size]
-            words_batch = words[i:i + batch_size]
+            words_batch = single_chunks[i:i + batch_size]
             top_indices_batch = top_indices[i:i + batch_size]
             top_rough_scores_batch = top_rough_scores[i:i + batch_size]
 
             # a_scores_batch    [batch_size, n_ants]
             a_scores_batch = self.a_scorer(
-                all_mentions=words, mentions_batch=words_batch,
+                all_mentions=single_chunks, mentions_batch=words_batch,
                 pw_batch=pw_batch, top_indices_batch=top_indices_batch,
                 top_rough_scores_batch=top_rough_scores_batch
             )
@@ -281,8 +298,8 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         for i in range(0, len(chunks), batch_size):
             pw_batch = pw_chunks[i:i + batch_size]
             words_batch = chunks[i:i + batch_size]
-            top_indices_batch = top_indices_chunk[i:i + batch_size]
-            top_rough_scores_batch = top_rough_scores_chunk[i:i + batch_size]
+            top_indices_batch = top_indices[i:i + batch_size]
+            top_rough_scores_batch = top_rough_scores[i:i + batch_size]
 
             # a_scores_batch    [batch_size, n_ants]
             a_scores_batch = self.a_scorer_chunk(
@@ -304,15 +321,15 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         #                                     top_indices)
         
         res.coref_y = self._get_ground_truth_chunk(
-            cluster_ids_chunk, top_indices_chunk, chunks_pos, (top_rough_scores_chunk > float("-inf")))
+            cluster_ids_chunk, top_indices, chunk_pos, (top_rough_scores > float("-inf")))
         res.word_clusters = self._clusterize_chunk(doc, res.coref_scores_chunk,
-                                             top_indices_chunk)
+                                             top_indices)
         #res.span_scores, res.span_y = self.sp.get_training_data(doc, words)
 
         #if not self.training:
         #    res.span_clusters = self.sp.predict(doc, words, res.word_clusters)
         if not self.training:
-            res.span_clusters = self.sp.predict_direct(res.word_clusters, chunks_pos)
+            res.span_clusters = self.sp.predict_direct(res.word_clusters, chunk_pos)
 
         return res
 
@@ -351,7 +368,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
 
                 for optim in self.optimizers.values():
                     optim.zero_grad()
-                with torch.autocast(device_type='cuda'):
+                with torch.cuda.amp.autocast():
                     res = self.run(doc)
                     long_doc_flag = res.long_doc_flag
 
