@@ -77,7 +77,6 @@ if __name__ == "__main__":
 
     if args.batch_size:
         model.config.a_scoring_batch_size = args.batch_size
-    model.config.a_scoring_batch_size = 256
 
     if args.mode == "train":
         if args.weights is not None or args.warm_start:
@@ -86,6 +85,7 @@ if __name__ == "__main__":
         with output_running_time():
             model.train()
     else:
+        #args.weights = "data/chunk_roberta_(e1_2023.03.13_08.33).pt"
         model.load_weights(path=args.weights, map_location="cpu",
                            ignore={"bert_optimizer", "general_optimizer",
                                    "bert_scheduler", "general_scheduler"})

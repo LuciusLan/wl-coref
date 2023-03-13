@@ -144,7 +144,7 @@ class PairwiseEncoderChunk(torch.nn.Module):
         temp = torch.zeros(len(chunks_pos), dtype=torch.long)
         for i, chunk in enumerate(chunks_pos):
             try:
-                assert doc["speaker"][chunk[0]] == doc["speaker"][chunk[1]]
+                assert doc["speaker"][chunk[0]] == doc["speaker"][chunk[1]-1]
                 temp[i] = str2int[doc["speaker"][chunk[0]]]
             except AssertionError:
                 pass
