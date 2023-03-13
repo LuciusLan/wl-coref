@@ -24,3 +24,5 @@ class CorefResult:
 
     span_scores: torch.Tensor = None                   # [n_heads, n_words, 2]
     span_y: Tuple[torch.Tensor, torch.Tensor] = None   # [n_heads] x2
+
+    long_doc_flag = False

@@ -130,7 +130,7 @@ class SpanPredictor(torch.nn.Module):
 
         heads_ids = torch.tensor(
             sorted(i for cluster in clusters for i in cluster),
-            device=self.device
+            device=self.device 
         )
 
         scores = self(doc, words, heads_ids)
@@ -144,3 +144,11 @@ class SpanPredictor(torch.nn.Module):
 
         return [[head2span[head] for head in cluster]
                 for cluster in clusters]
+
+    def predict_direct(self, clusters, cluster_pos):
+        temp = []
+        for cluster in clusters:
+            temp.append([])
+            for span in cluster:
+                temp[-1].append(tuple(cluster_pos[span]))
+        return temp
