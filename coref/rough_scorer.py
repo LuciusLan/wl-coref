@@ -98,7 +98,7 @@ class RoughScorerChunk(torch.nn.Module):
     def forward(self,  # type: ignore  # pylint: disable=arguments-differ  #35566 in pytorch
                 input1: torch.Tensor,
                 input2: torch.Tensor,
-                is_one2n: bool,
+                is_one2n: bool=False,
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns rough anaphoricity scores for candidates, which consist of

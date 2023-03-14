@@ -164,47 +164,6 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
 
         return (running_loss / len(docs), *s_checker.total_lea)
 
-    def load_weights(self,
-                     path: Optional[str] = None,
-                     ignore: Optional[Set[str]] = None,
-                     map_location: Optional[str] = None,
-                     noexception: bool = False) -> None:
-        """
-        Loads pretrained weights of modules saved in a file located at path.
-        If path is None, the last saved model with current configuration
-        in data_dir is loaded.
-        Assumes files are named like {configuration}_(e{epoch}_{time})*.pt.
-        """
-        if path is None:
-            pattern = rf"chunk_{self.config.section}_\(e(\d+)_[^()]*\).*\.pt"
-            files = []
-            for f in os.listdir(self.config.data_dir):
-                match_obj = re.match(pattern, f)
-                if match_obj:
-                    files.append((int(match_obj.group(1)), f))
-            if not files:
-                if noexception:
-                    print("No weights have been loaded", flush=True)
-                    return
-                raise OSError(f"No weights found in {self.config.data_dir}!")
-            _, path = sorted(files)[-1]
-            path = os.path.join(self.config.data_dir, path)
-
-        if map_location is None:
-            map_location = self.config.device
-        print(f"Loading from {path}...")
-        state_dicts = torch.load(path, map_location=map_location)
-        self.epochs_trained = state_dicts.pop("epochs_trained", 0)
-        for key, state_dict in state_dicts.items():
-            if not ignore or key not in ignore:
-                if key.endswith("_optimizer"):
-                    self.optimizers[key].load_state_dict(state_dict)
-                elif key.endswith("_scheduler"):
-                    self.schedulers[key].load_state_dict(state_dict)
-                else:
-                    self.trainable[key].load_state_dict(state_dict)
-                print(f"Loaded {key}")
-
     def run(self,  # pylint: disable=too-many-locals
             doc: Doc,
             ) -> CorefResult:
@@ -226,32 +185,34 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         # Obtain bilinear scores and leave only top-k antecedents for each word
         # top_rough_scores  [n_words, n_ants]
         # top_indices       [n_words, n_ants]
+
+        """chunks = []
+        for i, (s, e) in enumerate(doc["chunk_list"]):
+            chunks.append(torch.cat([words[s], words[e-1], torch.einsum('ij->i',words[s:e].transpose(0,1))/(e-s)],0))
+        for i, (s, e) in enumerate(doc["extra_chunks"]):
+            chunks.append(words[s].tile(3))
+        chunks = torch.stack(chunks)
+        chunk_pos = doc["chunk_list"].copy()
+        chunk_pos.extend(doc['extra_chunks'])
+        start_pos = torch.tensor(chunk_pos, dtype=torch.long, device=self.config.device)
+        start_pos = start_pos[:,0]"""
+
         single_chunks = []
         single_words = []
-        non_single = []
-        single_pos = []
-        nonsingle_pos = []
+        nonsingle = []
+        
+        for i, (s, e) in enumerate(doc["single_chunk_pos"]):
+            single_chunks.append(words[s].tile(3))
+            single_words.append(words[s])
+        for i, (s, e) in enumerate(doc["nonsingle_chunk_pos"]):
+            nonsingle.append(torch.cat([words[s], words[e-1], torch.einsum('ij->i',words[s:e].transpose(0,1))/(e-s)]))
 
-        for i, (s, e) in enumerate(doc["chunk_list"]):
-            chunk_rep = torch.cat([words[s], words[e-1], torch.einsum('ij->i',words[s:e].transpose(0,1))/(e-s)])
-            if e-s == 1:
-                single_chunks.append(words[s].tile(3))
-                single_words.append(words[s])
-                single_pos.append([s,e])
-            else:
-                non_single.append(chunk_rep)
-                nonsingle_pos.append([s,e])
-
-        for i, pos in enumerate(doc["extra_chunks"]):
-            single_chunks.append(words[pos[0]].tile(3))
-            single_words.append(words[pos[0]])
-            single_pos.append(pos)
         single_chunks = torch.stack(single_chunks)
         single_words = torch.stack(single_words)
-        non_single = torch.stack(non_single)
-        chunks = torch.cat([single_chunks, non_single], 0)
-        chunk_pos = single_pos
-        chunk_pos.extend(nonsingle_pos)
+        nonsingle = torch.stack(nonsingle)
+        chunks = torch.cat([single_chunks, nonsingle], 0)
+        chunk_pos = doc["single_chunk_pos"].copy()
+        chunk_pos.extend(doc["nonsingle_chunk_pos"])
         chunk_pos = torch.tensor(chunk_pos, dtype=torch.long, device=self.config.device)
         start_pos = chunk_pos[:, 0]
 
@@ -261,16 +222,18 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
             cluster_ids_chunk = torch.zeros(chunks.size(0), dtype=torch.long, device=self.config.device).unsqueeze(0)
 
         #top_rough_scores, top_indices = self.rough_scorer(single_chunks)
-        #top_rough_scores_chunk, top_indices_chunk = self.rough_scorer_chunk(chunks)
+        #top_rough_scores = self.rough_scorer_chunk(chunks, chunks, False)
+        #top_rough_scores, top_indices = self.rough_scorer_chunk._prune(top_rough_scores)
+        
         one2one_scores = self.rough_scorer(single_words)
-        one2n_scores = self.rough_scorer_chunk(single_chunks, non_single, is_one2n=True)
-        n2n_scores = self.rough_scorer_chunk(non_single, non_single, is_one2n=False)
-        n2one_scores = torch.log(torch.zeros_like(one2n_scores.T))
+        n2one_scores = self.rough_scorer_chunk(nonsingle, single_chunks, is_one2n=True)
+        n2n_scores = self.rough_scorer_chunk(nonsingle, nonsingle, is_one2n=False)
+        one2n_scores = torch.log(torch.zeros_like(n2one_scores.T))
         top_rough_scores = torch.cat((torch.cat((one2one_scores, n2one_scores), 0), torch.cat((one2n_scores, n2n_scores), 0)), 1)
         top_rough_scores, top_indices = self.rough_scorer._prune(top_rough_scores)
         # Get pairwise features [n_words, n_ants, n_pw_features]
+        #pw_chunks = self.pw_chunk(top_indices, doc, chunk_pos, start_pos)
         pw_chunks = self.pw_chunk(top_indices, doc, chunk_pos, start_pos)
-        #pw_chunks = self.pw_chunk(top_indices_chunk, doc, chunks_pos, start_pos)
 
         batch_size = self.config.a_scoring_batch_size
         #a_scores_lst: List[torch.Tensor] = []
@@ -332,6 +295,62 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
             res.span_clusters = self.sp.predict_direct(res.word_clusters, chunk_pos)
 
         return res
+    
+    @staticmethod
+    def _get_ground_truth(cluster_ids: torch.Tensor,
+                          top_indices: torch.Tensor,
+                          valid_pair_map: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            cluster_ids: tensor of shape [n_words], containing cluster indices
+                for each word. Non-gold words have cluster id of zero.
+            top_indices: tensor of shape [n_words, n_ants],
+                indices of antecedents of each word
+            valid_pair_map: boolean tensor of shape [n_words, n_ants],
+                whether for pair at [i, j] (i-th word and j-th word)
+                j < i is True
+
+        Returns:
+            tensor of shape [n_words, n_ants + 1] (dummy added),
+                containing 1 at position [i, j] if i-th and j-th words corefer.
+        """
+        y = cluster_ids[top_indices] * valid_pair_map  # [n_words, n_ants]
+        y[y == 0] = -1                                 # -1 for non-gold words
+        y = utils.add_dummy(y)                         # [n_words, n_cands + 1]
+        y = (y == cluster_ids.unsqueeze(1))            # True if coreferent
+        # For all rows with no gold antecedents setting dummy to True
+        y[y.sum(dim=1) == 0, 0] = True
+        return y.to(torch.float)
+
+    @staticmethod
+    def _get_ground_truth_chunk(cluster_ids: torch.Tensor,
+                          top_indices: torch.Tensor,
+                          chunk_pos,
+                          valid_pair_map: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            cluster_ids: tensor of shape [n_words], containing cluster indices
+                for each word. Non-gold words have cluster id of zero.
+            top_indices: tensor of shape [n_words, n_ants],
+                indices of antecedents of each word
+            valid_pair_map: boolean tensor of shape [n_words, n_ants],
+                whether for pair at [i, j] (i-th word and j-th word)
+                j < i is True
+
+        Returns:
+            tensor of shape [n_words, n_ants + 1] (dummy added),
+                containing 1 at position [i, j] if i-th and j-th words corefer.
+        """
+        y = torch.zeros_like(top_indices)
+        for row in cluster_ids:
+            y += row[top_indices] * valid_pair_map
+        #y = cluster_ids[top_indices] * valid_pair_map  # [n_words, n_ants]
+        y[y == 0] = -1                                 # -1 for non-gold words
+        y = utils.add_dummy(y)                         # [n_words, n_cands + 1]
+        y = (y == cluster_ids.sum(0).unsqueeze(1))            # True if coreferent
+        # For all rows with no gold antecedents setting dummy to True
+        y[y.sum(dim=1) == 0, 0] = True
+        return y.to(torch.float)
 
     def save_weights(self):
         """ Saves trainable models as state dicts. """
@@ -348,6 +367,47 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         savedict = {name: module.state_dict() for name, module in to_save}
         savedict["epochs_trained"] = self.epochs_trained  # type: ignore
         torch.save(savedict, path)
+
+    def load_weights(self,
+                     path: Optional[str] = None,
+                     ignore: Optional[Set[str]] = None,
+                     map_location: Optional[str] = None,
+                     noexception: bool = False) -> None:
+        """
+        Loads pretrained weights of modules saved in a file located at path.
+        If path is None, the last saved model with current configuration
+        in data_dir is loaded.
+        Assumes files are named like {configuration}_(e{epoch}_{time})*.pt.
+        """
+        if path is None:
+            pattern = rf"chunk_{self.config.section}_\(e(\d+)_[^()]*\).*\.pt"
+            files = []
+            for f in os.listdir(self.config.data_dir):
+                match_obj = re.match(pattern, f)
+                if match_obj:
+                    files.append((int(match_obj.group(1)), f))
+            if not files:
+                if noexception:
+                    print("No weights have been loaded", flush=True)
+                    return
+                raise OSError(f"No weights found in {self.config.data_dir}!")
+            _, path = sorted(files)[-1]
+            path = os.path.join(self.config.data_dir, path)
+
+        if map_location is None:
+            map_location = self.config.device
+        print(f"Loading from {path}...")
+        state_dicts = torch.load(path, map_location=map_location)
+        self.epochs_trained = state_dicts.pop("epochs_trained", 0)
+        for key, state_dict in state_dicts.items():
+            if not ignore or key not in ignore:
+                if key.endswith("_optimizer"):
+                    self.optimizers[key].load_state_dict(state_dict)
+                elif key.endswith("_scheduler"):
+                    self.schedulers[key].load_state_dict(state_dict)
+                else:
+                    self.trainable[key].load_state_dict(state_dict)
+                print(f"Loaded {key}")
 
     def train(self):
         """
@@ -460,7 +520,6 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         self.trainable: Dict[str, torch.nn.Module] = {
             "bert": self.bert, "we": self.we,
             "rough_scorer": self.rough_scorer,
-            "pw": self.pw, "a_scorer": self.a_scorer,
             "rough_scorer_chunk": self.rough_scorer_chunk,
             "pw_chunk": self.pw_chunk, "a_scorer_chunk": self.a_scorer_chunk,
             "sp": self.sp
@@ -609,7 +668,28 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                                 if pronoun == e:
                                     self._docs[path][doc_num]["extra_chunks"].append([chunk[0]+i,chunk[0]+i+1])
                 assert len(self._docs[path][doc_num]["chunk_list"]) == self._docs[path][doc_num]["conll_bound"].count(1)
+
+                single_chunk_pos = []
+                nonsingle_chunk_pos = []
+                for i, (s, e) in enumerate(item["chunk_list"]):
+                    if e-s == 1:
+                        single_chunk_pos.append([s,e])
+                    else:
+                        nonsingle_chunk_pos.append([s,e])
+                for i, pos in enumerate(item["extra_chunks"]):
+                    single_chunk_pos.append(pos)
+
                 cluster_ids_chunk = []
+                for i, cluster in enumerate(self._docs[path][doc_num]['span_clusters']):
+                    cluster_ids_chunk.append([0]*(len(single_chunk_pos)+len(nonsingle_chunk_pos)))
+                    for span in cluster:
+                        for ic, chunk in enumerate(single_chunk_pos):
+                            if chunk[0] == span[0] and chunk[1] == span[1]:
+                                cluster_ids_chunk[-1][ic] = i+1
+                        for ic, chunk in enumerate(nonsingle_chunk_pos):
+                            if chunk[0] == span[0] and chunk[1] == span[1]:
+                                cluster_ids_chunk[-1][ic+len(single_chunk_pos)] = i+1
+                """cluster_ids_chunk = []
                 for i, cluster in enumerate(self._docs[path][doc_num]['span_clusters']):
                     cluster_ids_chunk.append([0]*(len(self._docs[path][doc_num]['chunk_list'])+len(self._docs[path][doc_num]['extra_chunks'])))
                     for span in cluster:
@@ -618,65 +698,11 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                                 cluster_ids_chunk[-1][ic] = i+1
                         for ic, chunk in enumerate(self._docs[path][doc_num]['extra_chunks']):
                             if chunk[0] >= span[0] and chunk[1] <= span[1]:
-                                cluster_ids_chunk[-1][ic+len(self._docs[path][doc_num]['chunk_list'])] = i+1
+                                cluster_ids_chunk[-1][ic+len(self._docs[path][doc_num]['chunk_list'])] = i+1"""
                 self._docs[path][doc_num]['cluster_ids_chunk'] = cluster_ids_chunk
+                self._docs[path][doc_num]['single_chunk_pos'] = single_chunk_pos
+                self._docs[path][doc_num]['nonsingle_chunk_pos'] = nonsingle_chunk_pos
         return self._docs[path]
-
-    @staticmethod
-    def _get_ground_truth(cluster_ids: torch.Tensor,
-                          top_indices: torch.Tensor,
-                          valid_pair_map: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            cluster_ids: tensor of shape [n_words], containing cluster indices
-                for each word. Non-gold words have cluster id of zero.
-            top_indices: tensor of shape [n_words, n_ants],
-                indices of antecedents of each word
-            valid_pair_map: boolean tensor of shape [n_words, n_ants],
-                whether for pair at [i, j] (i-th word and j-th word)
-                j < i is True
-
-        Returns:
-            tensor of shape [n_words, n_ants + 1] (dummy added),
-                containing 1 at position [i, j] if i-th and j-th words corefer.
-        """
-        y = cluster_ids[top_indices] * valid_pair_map  # [n_words, n_ants]
-        y[y == 0] = -1                                 # -1 for non-gold words
-        y = utils.add_dummy(y)                         # [n_words, n_cands + 1]
-        y = (y == cluster_ids.unsqueeze(1))            # True if coreferent
-        # For all rows with no gold antecedents setting dummy to True
-        y[y.sum(dim=1) == 0, 0] = True
-        return y.to(torch.float)
-
-    @staticmethod
-    def _get_ground_truth_chunk(cluster_ids: torch.Tensor,
-                          top_indices: torch.Tensor,
-                          chunk_pos,
-                          valid_pair_map: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            cluster_ids: tensor of shape [n_words], containing cluster indices
-                for each word. Non-gold words have cluster id of zero.
-            top_indices: tensor of shape [n_words, n_ants],
-                indices of antecedents of each word
-            valid_pair_map: boolean tensor of shape [n_words, n_ants],
-                whether for pair at [i, j] (i-th word and j-th word)
-                j < i is True
-
-        Returns:
-            tensor of shape [n_words, n_ants + 1] (dummy added),
-                containing 1 at position [i, j] if i-th and j-th words corefer.
-        """
-        y = torch.zeros_like(top_indices)
-        for row in cluster_ids:
-            y += row[top_indices] * valid_pair_map
-        #y = cluster_ids[top_indices] * valid_pair_map  # [n_words, n_ants]
-        y[y == 0] = -1                                 # -1 for non-gold words
-        y = utils.add_dummy(y)                         # [n_words, n_cands + 1]
-        y = (y == cluster_ids.sum(0).unsqueeze(1))            # True if coreferent
-        # For all rows with no gold antecedents setting dummy to True
-        y[y.sum(dim=1) == 0, 0] = True
-        return y.to(torch.float)
 
     @staticmethod
     def _load_config(config_path: str,
