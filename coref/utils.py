@@ -3,6 +3,7 @@
 from typing import List, Set
 
 import torch
+from sklearn.metrics import f1_score
 
 from coref.const import EPSILON
 
@@ -33,3 +34,24 @@ def add_dummy(tensor: torch.Tensor, eps: bool = False):
     else:
         dummy = torch.full(shape, EPSILON, **kwargs)  # type: ignore
     return torch.cat((dummy, tensor), dim=1)
+
+def non_max_sup(candidates, thres=0.95):
+    """
+    Using Non-Maximum Suppression (NMS) to filter out highly similar spans
+    """
+    pick = []
+    filtered = {}
+    for i, row in enumerate(candidates):
+        filtered[i]= row
+    while len(filtered) > 0:
+        last = list(filtered.keys())[-1]
+        pick.append(filtered[last])
+        for key in list(filtered.keys()):
+            if key == last:
+                continue
+            f = f1_score(filtered[last], filtered[key], zero_division=1, average='macro')
+            if f < thres:
+                pick.append(filtered[key])
+            filtered.pop(key)
+        filtered.pop(last)
+    return pick

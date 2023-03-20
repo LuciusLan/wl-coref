@@ -26,7 +26,7 @@ from coref.pairwise_encoder import PairwiseEncoder, PairwiseEncoderChunk
 from coref.rough_scorer import RoughScorer, RoughScorerChunk
 from coref.span_predictor import SpanPredictor
 from coref.tokenizer_customization import TOKENIZER_FILTERS, TOKENIZER_MAPS
-from coref.utils import GraphNode
+from coref.utils import GraphNode, non_max_sup
 from coref.word_encoder import WordEncoder
 
 
@@ -186,7 +186,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         # top_rough_scores  [n_words, n_ants]
         # top_indices       [n_words, n_ants]
 
-        """chunks = []
+        chunks = []
         for i, (s, e) in enumerate(doc["chunk_list"]):
             chunks.append(torch.cat([words[s], words[e-1], torch.einsum('ij->i',words[s:e].transpose(0,1))/(e-s)],0))
         for i, (s, e) in enumerate(doc["extra_chunks"]):
@@ -195,9 +195,9 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         chunk_pos = doc["chunk_list"].copy()
         chunk_pos.extend(doc['extra_chunks'])
         start_pos = torch.tensor(chunk_pos, dtype=torch.long, device=self.config.device)
-        start_pos = start_pos[:,0]"""
+        start_pos = start_pos[:,0]
 
-        single_chunks = []
+        """single_chunks = []
         single_words = []
         nonsingle = []
         
@@ -214,7 +214,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         chunk_pos = doc["single_chunk_pos"].copy()
         chunk_pos.extend(doc["nonsingle_chunk_pos"])
         chunk_pos = torch.tensor(chunk_pos, dtype=torch.long, device=self.config.device)
-        start_pos = chunk_pos[:, 0]
+        start_pos = chunk_pos[:, 0]"""
 
 
         cluster_ids_chunk = torch.LongTensor(doc['cluster_ids_chunk']).to(self.config.device)
@@ -222,15 +222,15 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
             cluster_ids_chunk = torch.zeros(chunks.size(0), dtype=torch.long, device=self.config.device).unsqueeze(0)
 
         #top_rough_scores, top_indices = self.rough_scorer(single_chunks)
-        #top_rough_scores = self.rough_scorer_chunk(chunks, chunks, False)
-        #top_rough_scores, top_indices = self.rough_scorer_chunk._prune(top_rough_scores)
+        top_rough_scores = self.rough_scorer_chunk(chunks, chunks, False)
+        top_rough_scores, top_indices = self.rough_scorer_chunk._prune(top_rough_scores)
         
-        one2one_scores = self.rough_scorer(single_words)
+        """one2one_scores = self.rough_scorer(single_words)
         n2one_scores = self.rough_scorer_chunk(nonsingle, single_chunks, is_one2n=True)
         n2n_scores = self.rough_scorer_chunk(nonsingle, nonsingle, is_one2n=False)
         one2n_scores = torch.log(torch.zeros_like(n2one_scores.T))
         top_rough_scores = torch.cat((torch.cat((one2one_scores, n2one_scores), 0), torch.cat((one2n_scores, n2n_scores), 0)), 1)
-        top_rough_scores, top_indices = self.rough_scorer._prune(top_rough_scores)
+        top_rough_scores, top_indices = self.rough_scorer._prune(top_rough_scores)"""
         # Get pairwise features [n_words, n_ants, n_pw_features]
         #pw_chunks = self.pw_chunk(top_indices, doc, chunk_pos, start_pos)
         pw_chunks = self.pw_chunk(top_indices, doc, chunk_pos, start_pos)
@@ -287,12 +287,20 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
             cluster_ids_chunk, top_indices, chunk_pos, (top_rough_scores > float("-inf")))
         res.word_clusters = self._clusterize_chunk(doc, res.coref_scores_chunk,
                                              top_indices)
-        #res.span_scores, res.span_y = self.sp.get_training_data(doc, words)
+        with torch.cuda.amp.autocast(enabled=False):
+            #res.span_scores, res.span_y = self.sp.get_training_data(doc, words, False)
+            res.span_scores, res.span_y = self.sp.get_training_data(doc, words, True)
 
-        #if not self.training:
-        #    res.span_clusters = self.sp.predict(doc, words, res.word_clusters)
         if not self.training:
-            res.span_clusters = self.sp.predict_direct(res.word_clusters, chunk_pos)
+            temp_word_clus = []
+            for cluster in res.word_clusters:
+                temp_word_clus.append([])
+                for chunk in cluster:
+                    temp_word_clus[-1].extend([wp for wp in range(chunk_pos[chunk][0], chunk_pos[chunk][1])])
+            temp_clus = self.sp.predict(doc, words, temp_word_clus)
+            res.span_clusters = [non_max_sup(cluster) for cluster in temp_clus]
+        #if not self.training:
+        #    res.span_clusters = self.sp.predict_direct(res.word_clusters, chunk_pos)
 
         return res
     
@@ -415,7 +423,8 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         """
         docs = list(self._get_docs(self.config.train_data))
         docs_ids = list(range(len(docs)))
-        avg_spans = sum(len(doc["head2span"]) for doc in docs) / len(docs)
+        #avg_spans = sum(len(doc["head2span"]) for doc in docs) / len(docs)
+        avg_spans = sum(len(doc["chunk_head"]) for doc in docs) / len(docs)
 
         for epoch in range(self.epochs_trained, self.config.train_epochs):
             self.training = True
@@ -425,6 +434,8 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
             pbar = tqdm(docs_ids, unit="docs", ncols=0, total=len(docs))
             for step, doc_id in enumerate(pbar):
                 doc = docs[doc_id]
+                if step == 59:
+                    print()
 
                 for optim in self.optimizers.values():
                     optim.zero_grad()
@@ -679,7 +690,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                 for i, pos in enumerate(item["extra_chunks"]):
                     single_chunk_pos.append(pos)
 
-                cluster_ids_chunk = []
+                """cluster_ids_chunk = []
                 for i, cluster in enumerate(self._docs[path][doc_num]['span_clusters']):
                     cluster_ids_chunk.append([0]*(len(single_chunk_pos)+len(nonsingle_chunk_pos)))
                     for span in cluster:
@@ -688,8 +699,8 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                                 cluster_ids_chunk[-1][ic] = i+1
                         for ic, chunk in enumerate(nonsingle_chunk_pos):
                             if chunk[0] == span[0] and chunk[1] == span[1]:
-                                cluster_ids_chunk[-1][ic+len(single_chunk_pos)] = i+1
-                """cluster_ids_chunk = []
+                                cluster_ids_chunk[-1][ic+len(single_chunk_pos)] = i+1"""
+                cluster_ids_chunk = []
                 for i, cluster in enumerate(self._docs[path][doc_num]['span_clusters']):
                     cluster_ids_chunk.append([0]*(len(self._docs[path][doc_num]['chunk_list'])+len(self._docs[path][doc_num]['extra_chunks'])))
                     for span in cluster:
@@ -698,10 +709,30 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                                 cluster_ids_chunk[-1][ic] = i+1
                         for ic, chunk in enumerate(self._docs[path][doc_num]['extra_chunks']):
                             if chunk[0] >= span[0] and chunk[1] <= span[1]:
-                                cluster_ids_chunk[-1][ic+len(self._docs[path][doc_num]['chunk_list'])] = i+1"""
+                                cluster_ids_chunk[-1][ic+len(self._docs[path][doc_num]['chunk_list'])] = i+1
                 self._docs[path][doc_num]['cluster_ids_chunk'] = cluster_ids_chunk
                 self._docs[path][doc_num]['single_chunk_pos'] = single_chunk_pos
                 self._docs[path][doc_num]['nonsingle_chunk_pos'] = nonsingle_chunk_pos
+
+                chunk_head = []
+                temp_chunk_list = item['chunk_list'].copy()
+                temp_chunk_list.extend(item['extra_chunks'])
+                for e in item['head2span']:
+                    not_found = True
+                    for i, chunk in enumerate(temp_chunk_list):
+                        if chunk[0] >= e[1] and chunk[1] <= e[2]:
+                            for c in chunk[:-1]:
+                                chunk_head.append([c, e[1], e[2]])
+                            not_found = False
+                    if not_found:
+                        for i, chunk in enumerate(temp_chunk_list):
+                            if e[0] <= chunk[1] and e[0] >= chunk[0]:
+                                for c in chunk[:-1]:
+                                    chunk_head.append([c, e[1], e[2]])
+                chunk_head.sort()
+                chunk_head = list(e for e,_ in itertools.groupby(chunk_head))
+                self._docs[path][doc_num]['chunk_head'] = chunk_head
+                    
         return self._docs[path]
 
     @staticmethod

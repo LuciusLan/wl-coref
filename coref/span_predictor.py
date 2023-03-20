@@ -95,11 +95,15 @@ class SpanPredictor(torch.nn.Module):
 
     def get_training_data(self,
                           doc: Doc,
-                          words: torch.Tensor
+                          words: torch.Tensor,
+                          is_chunk: bool
                           ) -> Tuple[Optional[torch.Tensor],
                                      Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """ Returns span starts/ends for gold mentions in the document. """
-        head2span = sorted(doc["head2span"])
+        if is_chunk:
+            head2span = sorted(doc["chunk_head"])
+        else:
+            head2span = sorted(doc["head2span"])
         if not head2span:
             return None, None
         heads, starts, ends = zip(*head2span)
