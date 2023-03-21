@@ -26,7 +26,7 @@ from coref.const import CorefResult, Doc
 from coref.loss import CorefLoss
 from coref.pairwise_encoder import PairwiseEncoder, PairwiseEncoderChunk
 from coref.rough_scorer import RoughScorer, RoughScorerChunk
-from coref.span_predictor import SpanPredictor
+from coref.span_predictor import SpanPredictor, SpanPredictorChunk
 from coref.tokenizer_customization import TOKENIZER_FILTERS, TOKENIZER_MAPS
 from coref.utils import GraphNode, non_max_sup
 from coref.word_encoder import WordEncoder
@@ -72,7 +72,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         self._build_optimizers()
         self._set_training(False)
         self._coref_criterion = CorefLoss(self.config.bce_loss_weight)
-        self._span_criterion = torch.nn.CrossEntropyLoss(reduction="mean")
+        self._span_criterion = torch.nn.CrossEntropyLoss(reduction="sum")
 
         #self._tokenize_docs('data/english_test_head.jsonlines', 'test')
 
@@ -161,8 +161,21 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                     f" p: {s_lea[1]:.5f},"
                     f" r: {s_lea[2]:<.5f}"
                 )
+                self.logger.info(
+                    f"{data_split}:"
+                    f" | WL: "
+                    f" loss: {running_loss / (pbar.n + 1):<.5f},"
+                    f" f1: {w_lea[0]:.5f},"
+                    f" p: {w_lea[1]:.5f},"
+                    f" r: {w_lea[2]:<.5f}"
+                    f" | SL: "
+                    f" sa: {s_correct / s_total:<.5f},"
+                    f" f1: {s_lea[0]:.5f},"
+                    f" p: {s_lea[1]:.5f},"
+                    f" r: {s_lea[2]:<.5f}"
+                )
                 torch.cuda.empty_cache()
-            self.logger.info()
+            print()
 
         return (running_loss / len(docs), *s_checker.total_lea)
 
@@ -292,15 +305,18 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         with torch.cuda.amp.autocast(enabled=False):
             #res.span_scores, res.span_y = self.sp.get_training_data(doc, words, False)
             res.span_scores, res.span_y = self.sp.get_training_data(doc, words, True)
+            res.span_scores, res.span_y = self.sp_chunk.get_training_data(doc, chunks, True, start_pos)
 
-        if not self.training:
+        """if not self.training:
             temp_word_clus = []
             for cluster in res.word_clusters:
                 temp_word_clus.append([])
                 for chunk in cluster:
                     temp_word_clus[-1].extend([wp for wp in range(chunk_pos[chunk][0], chunk_pos[chunk][1])])
             temp_clus = self.sp.predict(doc, words, temp_word_clus)
-            res.span_clusters = [non_max_sup(cluster) for cluster in temp_clus]
+            res.span_clusters = [non_max_sup(cluster) for cluster in temp_clus]"""
+        if not self.training:
+            res.span_clusters = self.sp_chunk.predict(doc, words, res.word_clusters)
         #if not self.training:
         #    res.span_clusters = self.sp.predict_direct(res.word_clusters, chunk_pos)
 
@@ -437,7 +453,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
             for step, doc_id in enumerate(pbar):
                 doc = docs[doc_id]
                 if step == 417:
-                    self.logger.info()
+                    print()
 
                 for optim in self.optimizers.values():
                     optim.zero_grad()
@@ -520,12 +536,13 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         pair_emb_chunk = bert_emb * 9 + self.pw.shape
 
         # pylint: disable=line-too-long
-        self.a_scorer = AnaphoricityScorer(pair_emb, self.config).to(self.config.device)
+        #self.a_scorer = AnaphoricityScorer(pair_emb, self.config).to(self.config.device)
         self.a_scorer_chunk = AnaphoricityScorerChunk(pair_emb_chunk, self.config).to(self.config.device)
         self.we = WordEncoder(bert_emb, self.config).to(self.config.device)
-        self.rough_scorer = RoughScorer(bert_emb, self.config).to(self.config.device)
+        #self.rough_scorer = RoughScorer(bert_emb, self.config).to(self.config.device)
         self.rough_scorer_chunk = RoughScorerChunk(bert_emb*3, self.config).to(self.config.device)
         self.sp = SpanPredictor(bert_emb, self.config.sp_embedding_size).to(self.config.device)
+        self.sp_chunk = SpanPredictorChunk(bert_emb*3, self.config.sp_embedding_size).to(self.config.device)
 
         """self.trainable: Dict[str, torch.nn.Module] = {
             "bert": self.bert, "we": self.we,
@@ -535,10 +552,10 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         }"""
         self.trainable: Dict[str, torch.nn.Module] = {
             "bert": self.bert, "we": self.we,
-            "rough_scorer": self.rough_scorer,
             "rough_scorer_chunk": self.rough_scorer_chunk,
             "pw_chunk": self.pw_chunk, "a_scorer_chunk": self.a_scorer_chunk,
-            "sp": self.sp
+            "sp": self.sp,
+            "sp_chunk": self.sp_chunk
         }
 
     def _build_optimizers(self):
@@ -687,14 +704,17 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
 
                 single_chunk_pos = []
                 nonsingle_chunk_pos = []
+                sent_id_chunk = []
                 for i, (s, e) in enumerate(item["chunk_list"]):
                     if e-s == 1:
                         single_chunk_pos.append([s,e])
                     else:
                         nonsingle_chunk_pos.append([s,e])
+                    sent_id_chunk.append(item["sent_id"][s])
                 for i, pos in enumerate(item["extra_chunks"]):
                     single_chunk_pos.append(pos)
-
+                    sent_id_chunk.append(item["sent_id"][pos[0]])
+                self._docs[path][doc_num]["sent_id_chunk"] = sent_id_chunk
                 """cluster_ids_chunk = []
                 for i, cluster in enumerate(self._docs[path][doc_num]['span_clusters']):
                     cluster_ids_chunk.append([0]*(len(single_chunk_pos)+len(nonsingle_chunk_pos)))
@@ -722,7 +742,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                 chunk_head = []
                 temp_chunk_list = item['chunk_list'].copy()
                 temp_chunk_list.extend(item['extra_chunks'])
-                for e in item['head2span']:
+                """for e in item['head2span']:
                     not_found = True
                     for i, chunk in enumerate(temp_chunk_list):
                         if chunk[0] >= e[1] and chunk[1] <= e[2]:
@@ -733,7 +753,35 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                         for i, chunk in enumerate(temp_chunk_list):
                             if e[0] <= chunk[1] and e[0] >= chunk[0]:
                                 for c in list(range(chunk[0], chunk[1]))[:-1]:
-                                    chunk_head.append([c, e[1], e[2]])
+                                    chunk_head.append([c, e[1], e[2]])"""
+                for e in item['head2span']:
+                    not_found = True
+                    head_candidate = []
+                    for i, chunk in enumerate(temp_chunk_list):
+                        if chunk[0] >= e[1] and chunk[1] <= e[2]:
+                            temp_start_pos = -1
+                            temp_end_pos = -1
+                            for ic, c in enumerate(temp_chunk_list):
+                                if e[1] == c[0]:
+                                    temp_start_pos = ic
+                            for ic, c in enumerate(temp_chunk_list):
+                                if e[2] == c[1]:
+                                    temp_end_pos = ic
+                            if temp_start_pos != -1 and temp_end_pos != -1:
+                                head_candidate.append([i, temp_start_pos, temp_end_pos])
+                                not_found = False
+                    if len(head_candidate) > 1:
+                        for head in head_candidate:
+                            chunk = temp_chunk_list[head[0]]
+                            if chunk[0] <= e[0] and chunk[1] >= e[0]:
+                                chunk_head.append(head)
+                    elif len(head_candidate) == 1:
+                        chunk_head.append(head_candidate[0])
+                    """if not_found:
+                        for i, chunk in enumerate(temp_chunk_list):
+                            if e[0] <= chunk[1] and e[0] >= chunk[0]:
+                                for c in list(range(chunk[0], chunk[1]))[:-1]:
+                                    chunk_head.append([c, e[1], e[2]])"""
                 chunk_head.sort()
                 chunk_head = list(e for e,_ in itertools.groupby(chunk_head))
                 self._docs[path][doc_num]['chunk_head'] = chunk_head
