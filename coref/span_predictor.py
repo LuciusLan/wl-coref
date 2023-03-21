@@ -101,7 +101,8 @@ class SpanPredictor(torch.nn.Module):
                                      Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """ Returns span starts/ends for gold mentions in the document. """
         if is_chunk:
-            head2span = sorted(doc["chunk_head"])
+            #head2span = sorted(doc["chunk_head"])
+            head2span = sorted(doc["head2span"])
         else:
             head2span = sorted(doc["head2span"])
         if not head2span:

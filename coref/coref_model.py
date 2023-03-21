@@ -6,12 +6,14 @@ import pickle
 import random
 import re
 import itertools
+import math
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np      # type: ignore
 import jsonlines        # type: ignore
 import toml
 import torch
+from torch.nn.utils import clip_grad_norm_
 from tqdm import tqdm   # type: ignore
 import transformers     # type: ignore
 import json
@@ -70,7 +72,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         self._build_optimizers()
         self._set_training(False)
         self._coref_criterion = CorefLoss(self.config.bce_loss_weight)
-        self._span_criterion = torch.nn.CrossEntropyLoss(reduction="sum")
+        self._span_criterion = torch.nn.CrossEntropyLoss(reduction="mean")
 
         #self._tokenize_docs('data/english_test_head.jsonlines', 'test')
 
@@ -160,7 +162,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                     f" r: {s_lea[2]:<.5f}"
                 )
                 torch.cuda.empty_cache()
-            print()
+            self.logger.info()
 
         return (running_loss / len(docs), *s_checker.total_lea)
 
@@ -396,7 +398,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                     files.append((int(match_obj.group(1)), f))
             if not files:
                 if noexception:
-                    print("No weights have been loaded", flush=True)
+                    self.logger.info("No weights have been loaded", flush=True)
                     return
                 raise OSError(f"No weights found in {self.config.data_dir}!")
             _, path = sorted(files)[-1]
@@ -404,7 +406,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
 
         if map_location is None:
             map_location = self.config.device
-        print(f"Loading from {path}...")
+        self.logger.info(f"Loading from {path}...")
         state_dicts = torch.load(path, map_location=map_location)
         self.epochs_trained = state_dicts.pop("epochs_trained", 0)
         for key, state_dict in state_dicts.items():
@@ -415,7 +417,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                     self.schedulers[key].load_state_dict(state_dict)
                 else:
                     self.trainable[key].load_state_dict(state_dict)
-                print(f"Loaded {key}")
+                self.logger.info(f"Loaded {key}")
 
     def train(self):
         """
@@ -434,8 +436,8 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
             pbar = tqdm(docs_ids, unit="docs", ncols=0, total=len(docs))
             for step, doc_id in enumerate(pbar):
                 doc = docs[doc_id]
-                if step == 59:
-                    print()
+                if step == 417:
+                    self.logger.info()
 
                 for optim in self.optimizers.values():
                     optim.zero_grad()
@@ -451,6 +453,8 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                     else:
                         s_loss = torch.zeros_like(c_loss)
 
+                    if s_loss == math.inf:
+                        print()
                     del res
                     if long_doc_flag:
                         torch.cuda.empty_cache()
@@ -460,7 +464,8 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                 running_s_loss += s_loss.item()
 
                 del c_loss, s_loss
-
+                for module in self.trainable.values():
+                    clip_grad_norm_(module.parameters(), 5.0)
                 for optim in self.optimizers.values():
                     optim.step()
                 for scheduler in self.schedulers.values():
@@ -721,13 +726,13 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                     not_found = True
                     for i, chunk in enumerate(temp_chunk_list):
                         if chunk[0] >= e[1] and chunk[1] <= e[2]:
-                            for c in chunk[:-1]:
+                            for c in list(range(chunk[0], chunk[1]))[:-1]:
                                 chunk_head.append([c, e[1], e[2]])
                             not_found = False
                     if not_found:
                         for i, chunk in enumerate(temp_chunk_list):
                             if e[0] <= chunk[1] and e[0] >= chunk[0]:
-                                for c in chunk[:-1]:
+                                for c in list(range(chunk[0], chunk[1]))[:-1]:
                                     chunk_head.append([c, e[1], e[2]])
                 chunk_head.sort()
                 chunk_head = list(e for e,_ in itertools.groupby(chunk_head))
@@ -753,7 +758,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
             module.train(self._training)
 
     def _tokenize_docs(self, path: str) -> List[Doc]:
-        print(f"Tokenizing documents at {path}...", flush=True)
+        self.logger.info(f"Tokenizing documents at {path}...", flush=True)
         out: List[Doc] = []
         filter_func = TOKENIZER_FILTERS.get(self.config.bert_model,
                                             lambda _: True)
@@ -777,5 +782,5 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                 doc["subwords"] = subwords
                 doc["word_id"] = word_id
                 out.append(doc)
-        print("Tokenization OK", flush=True)
+        self.logger.info("Tokenization OK", flush=True)
         return out

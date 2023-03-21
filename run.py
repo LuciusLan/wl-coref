@@ -14,6 +14,7 @@ import numpy as np  # type: ignore
 import torch        # type: ignore
 
 from coref import CorefModel
+from coref.utils import init_logger
 
 
 @contextmanager
@@ -67,6 +68,8 @@ if __name__ == "__main__":
                                 " 'train' mode.")
     args = argparser.parse_args()
 
+    
+
     if args.warm_start and args.weights is not None:
         print("The following options are incompatible:"
               " '--warm_start' and '--weights'", file=sys.stderr)
@@ -74,7 +77,7 @@ if __name__ == "__main__":
 
     seed(2020)
     model = CorefModel(args.config_file, args.experiment)
-
+    model.logger = init_logger(log_file=f'{model.config.data_dir}.log')
     if args.batch_size:
         model.config.a_scoring_batch_size = args.batch_size
 
