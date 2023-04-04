@@ -201,8 +201,8 @@ class SpanPredictorChunk(torch.nn.Module):
             torch.Tensor: span start/end scores, [n_heads, n_words, 2]
         """
         # Obtain distance embedding indices, [n_heads, n_words]
-        #relative_positions = (heads_ids.unsqueeze(1) - torch.arange(words.shape[0], device=words.device).unsqueeze(0))
-        relative_positions = heads_ids.unsqueeze(1) - start_pos.unsqueeze(0)
+        relative_positions = (heads_ids.unsqueeze(1) - torch.arange(words.shape[0], device=words.device).unsqueeze(0))
+        #relative_positions = heads_ids.unsqueeze(1) - start_pos.unsqueeze(0)
         emb_ids = relative_positions + 63               # make all valid distances positive
         emb_ids[(emb_ids < 0) + (emb_ids > 126)] = 127  # "too_far"
 
@@ -215,6 +215,8 @@ class SpanPredictorChunk(torch.nn.Module):
         # for each candidate among the words in the same sentence as span_head
         # [n_heads, input_size * 2 + distance_emb_size]
         rows, cols = same_sent.nonzero(as_tuple=True)
+        #rows = torch.ones_like(rows, dtype=torch.bool)
+        #cols = torch.ones_like(cols, dtype=torch.bool)
         pair_matrix = torch.cat((
             words[heads_ids[rows]],
             words[cols],
@@ -249,7 +251,7 @@ class SpanPredictorChunk(torch.nn.Module):
                           doc: Doc,
                           words: torch.Tensor,
                           is_chunk: bool,
-                          start_pos: torch.Tensor
+                          start_pos: torch.Tensor,
                           ) -> Tuple[Optional[torch.Tensor],
                                      Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """ Returns span starts/ends for gold mentions in the document. """
@@ -268,7 +270,9 @@ class SpanPredictorChunk(torch.nn.Module):
     def predict(self,
                 doc: Doc,
                 words: torch.Tensor,
-                clusters: List[List[int]]) -> List[List[Span]]:
+                clusters: List[List[int]],
+                start_pos,
+                chunk_pos) -> List[List[Span]]:
         """
         Predicts span clusters based on the word clusters.
 
@@ -290,7 +294,7 @@ class SpanPredictorChunk(torch.nn.Module):
             device=self.device 
         )
 
-        scores = self(doc, words, heads_ids)
+        scores = self(doc, words, heads_ids, start_pos)
         starts = scores[:, :, 0].argmax(dim=1).tolist()
         ends = (scores[:, :, 1].argmax(dim=1) + 1).tolist()
 
@@ -299,8 +303,15 @@ class SpanPredictorChunk(torch.nn.Module):
             for head, start, end in zip(heads_ids.tolist(), starts, ends)
         }
 
-        return [[head2span[head] for head in cluster]
+        pred_clusters = [[head2span[head] for head in cluster]
                 for cluster in clusters]
+        temp = []
+        for cluster in pred_clusters:
+            temp.append([])
+            for span in cluster:
+                temp[-1].append((chunk_pos[span[0]][0], chunk_pos[span[1]-1][1]))
+        return temp
+
 
     def predict_direct(self, clusters, cluster_pos):
         temp = []

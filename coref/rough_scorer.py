@@ -39,8 +39,8 @@ class RoughScorer(torch.nn.Module):
 
         rough_scores = pair_mask + bilinear_scores
 
-        #return self._prune(rough_scores)
-        return rough_scores
+        return self._prune(rough_scores)
+        #return rough_scores
 
     def _prune(self,
                rough_scores: torch.Tensor

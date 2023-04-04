@@ -14,7 +14,6 @@ import numpy as np  # type: ignore
 import torch        # type: ignore
 
 from coref import CorefModel
-from coref.coref_token import CorefTokenModel
 from coref.sep_span_predictor import SpanModel
 from coref.utils import init_logger
 
@@ -78,34 +77,24 @@ if __name__ == "__main__":
         sys.exit(1)
 
     seed(2020)
-    if args.mode != "train_sp" and args.mode != "eval_sp":
-        model = CorefModel(args.config_file, args.experiment)
-        #model = CorefTokenModel(args.config_file, args.experiment)
-        model.logger = init_logger(log_file=f'{model.config.data_dir}.log')
-        if args.batch_size:
-            model.config.a_scoring_batch_size = args.batch_size
-    else:
-        model = SpanModel(args.config_file, args.experiment)
-        model.logger = init_logger(log_file=f'{model.config.data_dir}.log')
-        if args.batch_size:
-            model.config.a_scoring_batch_size = args.batch_size
+    coref_model = CorefModel(args.config_file, args.experiment)
+    coref_model.logger = init_logger(log_file=f'{coref_model.config.data_dir}.log')
+    if args.batch_size:
+        coref_model.config.a_scoring_batch_size = args.batch_size
+    
+    span_model = SpanModel(args.config_file, args.experiment)
+    span_model.logger = init_logger(log_file=f'{coref_model.config.data_dir}.log')
+    if args.batch_size:
+        span_model.config.a_scoring_batch_size = args.batch_size
 
-    if args.mode == "train":
-        if args.weights is not None or args.warm_start:
-            model.load_weights(path=args.weights, map_location="cpu",
-                               noexception=args.warm_start)
-        with output_running_time():
-            model.train()
-    elif args.mode == "train_sp":
-        if args.weights is not None or args.warm_start:
-            model.load_weights(path=args.weights, map_location="cpu",
-                               noexception=args.warm_start)
-        with output_running_time():
-            model.train()
-    elif args.mode == "eval" or args.mode == "eval_sp":
-        #args.weights = "data/chunk_roberta_split.pt"
-        model.load_weights(path=args.weights, map_location="cpu",
-                           ignore={"bert_optimizer", "general_optimizer",
-                                   "bert_scheduler", "general_scheduler"})
-        model.evaluate(data_split=args.data_split,
-                       word_level_conll=args.word_level)
+
+
+        #args.weights = "data/chunk_roberta_(e1_2023.03.13_08.33).pt"
+    coref_model.load_weights(path="data/chunk_roberta_split.pt", map_location="cpu",
+                        ignore={"bert_optimizer", "general_optimizer",
+                                "bert_scheduler", "general_scheduler"})
+    span_model.load_weights(path="data/chunk_roberta_best.pt", map_location="cpu",
+                        ignore={"bert_optimizer", "general_optimizer",
+                                "bert_scheduler", "general_scheduler"})
+    coref_model.evaluate(data_split=args.data_split,
+                    word_level_conll=args.word_level, sp_model=span_model)

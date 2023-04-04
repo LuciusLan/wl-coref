@@ -61,7 +61,7 @@ class ClusterChecker:
         resolutions = []
         for entity in key:
             size = len(entity)
-            if size == 1:  # entities of size 1 are not annotated
+            if size == 1 or size == 0:  # entities of size 1 are not annotated
                 continue
             importances.append(size)
             correct_links = 0

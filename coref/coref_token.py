@@ -35,7 +35,7 @@ from coref.utils import GraphNode, non_max_sup
 from coref.word_encoder import WordEncoder
 
 
-class CorefModel:  # pylint: disable=too-many-instance-attributes
+class CorefTokenModel:  # pylint: disable=too-many-instance-attributes
     """Combines all coref modules together to find coreferent spans.
 
     Attributes:
@@ -68,7 +68,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
             epochs_trained (int): the number of epochs finished
                 (useful for warm start)
         """
-        self.config = CorefModel._load_config(config_path, section)
+        self.config = CorefTokenModel._load_config(config_path, section)
         self.epochs_trained = epochs_trained
         self._docs: Dict[str, List[Doc]] = {}
         self._build_model()
@@ -91,53 +91,16 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         self._set_training(new_value)
 
     # ========================================================== Public methods
-
-
-    def case_print(self, doc, clusters):
+    
+    def case_print_wl(self, doc, clusters):
         for i, clus in enumerate(clusters):
             print(f"Cluster {i}")
             for span in clus:
                 try:
-                    print(f"Context: {doc['cased_words'][span[0]-5:span[1]+5]}")
-                    print(f"Entity: {doc['cased_words'][span[0]:span[1]]}\n")
+                    print(f"Context: {doc['cased_words'][span-5:span+5]}")
+                    print(f"Entity: {doc['cased_words'][span]}\n")
                 except IndexError:
-                    print(f"Entity: {doc['cased_words'][span[0]:span[1]]}\n")
-
-    def case_print_cl(self, doc, clusters):
-        new_clusters = []
-        for i, clus in enumerate(clusters):
-            new_clusters.append([])
-            
-            prev = 999
-            temp_cont = []
-            for i, chunk in enumerate(clus):
-                if chunk == prev+1:
-                    temp_cont.append(chunk)
-                else:
-                    if temp_cont != []:
-                        new_clusters[-1].append(temp_cont)
-                    temp_cont = [chunk]
-                if i == len(clus) -1:
-                    new_clusters[-1].append(temp_cont)
-                prev = chunk
-        for i, clus in enumerate(new_clusters):
-            print(f"Cluster {i}")
-            for chunk in clus:
-                if len(chunk) > 1:
-                    try:
-                        span = [doc['splitted_chunk'][chunk[0]][0], doc['splitted_chunk'][chunk[-1]][1]]
-                        print(f"Context: {doc['cased_words'][span[0]-5:span[1]+5]}")
-                        print(f"Entity: {doc['cased_words'][span[0]:span[1]]}\n")
-                    except IndexError:
-                        print(f"Entity: {doc['cased_words'][span[0]:span[1]]}\n")
-                else:
-                    chunk = chunk[0]
-                    try:
-                        span = doc['splitted_chunk'][chunk]
-                        print(f"Context: {doc['cased_words'][span[0]-5:span[1]+5]}")
-                        print(f"Entity: {doc['cased_words'][span[0]:span[1]]}\n")
-                    except IndexError:
-                        print(f"Entity: {doc['cased_words'][span[0]:span[1]]}\n")
+                    print(f"Entity: {doc['cased_words'][span]}\n")
 
     @torch.no_grad()
     def evaluate(self,
@@ -170,9 +133,10 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                 res = self.run(doc)
                 #sp_res = sp_model.run(doc, True, res.word_clusters)
 
-                #running_loss += self._coref_criterion(res.coref_scores, res.coref_y).item()
-                running_loss += self._coref_criterion(res.coref_scores_chunk, res.coref_y).item()
-                
+                running_loss += self._coref_criterion(res.coref_scores, res.coref_y).item()
+                #running_loss += self._coref_criterion(res.coref_scores_chunk, res.coref_y).item()
+                if doc['document_id'] == 'bc/cctv/00/cctv_0005':
+                    print()
                 if res.span_y:
                     """pred_starts = sp_res.span_scores[:, :, 0].argmax(dim=1)
                     pred_ends = sp_res.span_scores[:, :, 1].argmax(dim=1)
@@ -195,16 +159,14 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                     conll.write_conll(doc, doc["span_clusters"], gold_f)
                     conll.write_conll(doc, res.span_clusters, pred_f)
 
-                #w_checker.add_predictions(doc["word_clusters"], res.word_clusters)
+                w_checker.add_predictions(doc["word_clusters"], res.word_clusters)
                 
-                chunk_clus_target = [[] for i in range(len(doc['cluster_ids_chunk']))]
+                """chunk_clus_target = [[] for i in range(len(doc['cluster_ids_chunk']))]
                 temp = torch.tensor(doc['cluster_ids_chunk'].copy()).nonzero().tolist()
                 for e in temp:
                     chunk_clus_target[e[0]].append(e[1])
-
-                #self.case_print_cl(doc, chunk_clus_target)
                 
-                w_checker.add_predictions(chunk_clus_target, res.word_clusters)
+                w_checker.add_predictions(chunk_clus_target, res.word_clusters)"""
                 w_lea = w_checker.total_lea
 
                 s_checker.add_predictions(doc["span_clusters"], res.span_clusters)
@@ -267,7 +229,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         # top_rough_scores  [n_words, n_ants]
         # top_indices       [n_words, n_ants]
 
-        chunk_pos = doc["splitted_chunk"].copy()
+        """chunk_pos = doc["splitted_chunk"].copy()
         start_pos = torch.tensor(chunk_pos, dtype=torch.long, device=self.config.device)
                 
         mask_range = torch.arange(len(doc['cased_words']), device=self.config.device)
@@ -277,10 +239,10 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         slice_sum = slice_masks.sum(1)
 
 
-        #chunk_feature = self.chunk_aux(doc, slice_sum, start_pos[:,0])
+        chunk_feature = self.chunk_aux(doc, slice_sum, start_pos[:,0])
 
-        #chunks = torch.cat([words[start_pos[:,0]], words[start_pos[:,1]-1], torch.div(slice_masks.mm(words).transpose(0,1), slice_sum).transpose(0,1)],dim=1)
-        chunks = words[start_pos[:,0]]
+        chunks = torch.cat([words[start_pos[:,0]], words[start_pos[:,1]-1], torch.div(slice_masks.mm(words).transpose(0,1), slice_sum).transpose(0,1), chunk_feature],dim=1)"""
+        
         """chunks = []
         for i, (s, e) in enumerate(doc["splitted_chunk"]):
             chunks.append(torch.cat([words[s], words[e-1], torch.einsum('ij->i',words[s:e].transpose(0,1))/(e-s)],0))"""
@@ -291,7 +253,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         #chunks = torch.stack(chunks)
         #chunk_pos = doc["chunk_list"].copy()
         #chunk_pos.extend(doc['extra_chunks'])
-        start_pos = start_pos[:,0]
+        #start_pos = start_pos[:,0]
 
         """single_chunks = []
         single_words = []
@@ -313,13 +275,13 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         start_pos = chunk_pos[:, 0]"""
 
 
-        cluster_ids_chunk = torch.LongTensor(doc['cluster_ids_chunk']).to(self.config.device)
+        """cluster_ids_chunk = torch.LongTensor(doc['cluster_ids_chunk']).to(self.config.device)
         if cluster_ids_chunk.size(0) == 0:
-            cluster_ids_chunk = torch.zeros(chunks.size(0), dtype=torch.long, device=self.config.device).unsqueeze(0)
+            cluster_ids_chunk = torch.zeros(chunks.size(0), dtype=torch.long, device=self.config.device).unsqueeze(0)"""
 
-        #top_rough_scores, top_indices = self.rough_scorer(single_chunks)
-        top_rough_scores = self.rough_scorer_chunk(chunks, chunks, False)
-        top_rough_scores, top_indices = self.rough_scorer_chunk._prune(top_rough_scores)
+        top_rough_scores, top_indices = self.rough_scorer(words)
+        #top_rough_scores = self.rough_scorer_chunk(chunks, chunks, False)
+        #top_rough_scores, top_indices = self.rough_scorer_chunk._prune(top_rough_scores)
         
         """one2one_scores = self.rough_scorer(single_words)
         n2one_scores = self.rough_scorer_chunk(nonsingle, single_chunks, is_one2n=True)
@@ -329,32 +291,31 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         top_rough_scores, top_indices = self.rough_scorer._prune(top_rough_scores)"""
         # Get pairwise features [n_words, n_ants, n_pw_features]
         #pw_chunks = self.pw_chunk(top_indices, doc, chunk_pos, start_pos)
-        pw_chunks = self.pw_chunk(top_indices, doc, chunk_pos, start_pos)
+        #pw_chunks = self.pw_chunk(top_indices, doc, chunk_pos, start_pos)
+        pw = self.pw(top_indices, doc)
 
         batch_size = self.config.a_scoring_batch_size
-        #a_scores_lst: List[torch.Tensor] = []
-        a_scores_chunk_lst = []
+        a_scores_lst: List[torch.Tensor] = []
+        #a_scores_chunk_lst = []
 
-        """for i in range(0, len(single_chunks), batch_size):
+        for i in range(0, len(words), batch_size):
             pw_batch = pw[i:i + batch_size]
-            words_batch = single_chunks[i:i + batch_size]
+            words_batch = words[i:i + batch_size]
             top_indices_batch = top_indices[i:i + batch_size]
             top_rough_scores_batch = top_rough_scores[i:i + batch_size]
 
             # a_scores_batch    [batch_size, n_ants]
             a_scores_batch = self.a_scorer(
-                all_mentions=single_chunks, mentions_batch=words_batch,
+                all_mentions=words, mentions_batch=words_batch,
                 pw_batch=pw_batch, top_indices_batch=top_indices_batch,
                 top_rough_scores_batch=top_rough_scores_batch
             )
-            a_scores_lst.append(a_scores_batch)"""
+            a_scores_lst.append(a_scores_batch)
         
         res = CorefResult()
-        if len(chunks) > 1500:
-            res.long_doc_flag = True
 
         # coref_scores  [n_spans, n_ants]
-        for i in range(0, len(chunks), batch_size):
+        """for i in range(0, len(chunks), batch_size):
             pw_batch = pw_chunks[i:i + batch_size]
             words_batch = chunks[i:i + batch_size]
             top_indices_batch = top_indices[i:i + batch_size]
@@ -366,27 +327,29 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                 pw_batch=pw_batch, top_indices_batch=top_indices_batch,
                 top_rough_scores_batch=top_rough_scores_batch
             )
-            a_scores_chunk_lst.append(a_scores_batch)
+            a_scores_chunk_lst.append(a_scores_batch)"""
             
-        #res.coref_scores = torch.cat(a_scores_lst, dim=0)
+        res.coref_scores = torch.cat(a_scores_lst, dim=0)
 
-        res.coref_scores_chunk = torch.cat(a_scores_chunk_lst, dim=0)
+        res.coref_y = self._get_ground_truth(
+            cluster_ids, top_indices, (top_rough_scores > float("-inf")))
 
-        #res.coref_y = self._get_ground_truth(
-        #    cluster_ids, top_indices, (top_rough_scores > float("-inf")))
-                
-        # TODO: clustering for chunks
-        #res.word_clusters = self._clusterize(doc, res.coref_scores,
-        #                                     top_indices)
+        res.word_clusters = self._clusterize(doc, res.coref_scores,
+                                             top_indices)
         
+        """
+        res.coref_scores_chunk = torch.cat(a_scores_chunk_lst, dim=0)
         res.coref_y = self._get_ground_truth_chunk(
             cluster_ids_chunk, top_indices, chunk_pos, (top_rough_scores > float("-inf")))
         res.word_clusters = self._clusterize_chunk(doc, res.coref_scores_chunk,
-                                             top_indices)
+                                             top_indices)"""
         with torch.cuda.amp.autocast(enabled=False):
             #res.span_scores, res.span_y = self.sp.get_training_data(doc, words, False)
-        #res.span_scores, res.span_y = self.sp.get_training_data(doc, words, True)
-            res.span_scores, res.span_y = self.sp_chunk.get_training_data(doc, chunks, True, start_pos)
+            res.span_scores, res.span_y = self.sp.get_training_data(doc, words, False)
+        #res.span_scores, res.span_y = self.sp_chunk.get_training_data(doc, chunks, True, start_pos)
+
+        if not self.training:
+            res.span_clusters = self.sp.predict(doc, words, res.word_clusters)
 
         """if not self.training:
             temp_word_clus = []
@@ -396,8 +359,8 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                     temp_word_clus[-1].extend([wp for wp in range(chunk_pos[chunk][0], chunk_pos[chunk][1])])
             temp_clus = self.sp.predict(doc, words, temp_word_clus)
             res.span_clusters = [non_max_sup(cluster) for cluster in temp_clus]"""
-        if not self.training:
-            res.span_clusters = self.sp_chunk.predict(doc, chunks, res.word_clusters, start_pos, chunk_pos)
+        #if not self.training:
+        #    res.span_clusters = self.sp_chunk.predict(doc, chunks, res.word_clusters, start_pos, chunk_pos)
         #if not self.training:
         #    res.span_clusters = self.sp_chunk.predict_direct(res.word_clusters, chunk_pos)
 
@@ -490,7 +453,7 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
         """
         if path is None:
             #pattern = rf"chunk_{self.config.section}_\(e(\d+)_[^()]*\).*\.pt"
-            pattern = rf"chunk_{self.config.section}_best.pt"
+            pattern = rf"token_{self.config.section}_best.pt"
             files = []
             for f in os.listdir(self.config.data_dir):
                 match_obj = re.match(pattern, f)
@@ -547,8 +510,8 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                     res = self.run(doc)
                     long_doc_flag = res.long_doc_flag
 
-                    #c_loss = self._coref_criterion(res.coref_scores, res.coref_y)
-                    c_loss = self._coref_criterion(res.coref_scores_chunk, res.coref_y)
+                    c_loss = self._coref_criterion(res.coref_scores, res.coref_y)
+                    #c_loss = self._coref_criterion(res.coref_scores_chunk, res.coref_y)
                     if res.span_y:
                         s_loss = (self._span_criterion(res.span_scores[:, :, 0], res.span_y[0])
                                 + self._span_criterion(res.span_scores[:, :, 1], res.span_y[1])) / avg_spans / 2
@@ -619,40 +582,37 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
 
     def _build_model(self):
         self.bert, self.tokenizer = bert.load_bert(self.config)
-        #self.pw = PairwiseEncoder(self.config).to(self.config.device)
-        self.pw_chunk = PairwiseEncoderChunk(self.config).to(self.config.device)
-        self.chunk_aux = ChunkEncoder(self.config).to(self.config.device)
+        self.pw = PairwiseEncoder(self.config).to(self.config.device)
+        #self.pw_chunk = PairwiseEncoderChunk(self.config).to(self.config.device)
+        #self.chunk_aux = ChunkEncoder(self.config).to(self.config.device)
 
         bert_emb = self.bert.config.hidden_size
-        #pair_emb = bert_emb * 3 + self.pw.shape
+        pair_emb = bert_emb * 3 + self.pw.shape
         #pair_emb_chunk = (bert_emb * 3+self.chunk_aux.shape)*3 + self.pw_chunk.shape
-        pair_emb_chunk = (bert_emb)*3 + self.pw_chunk.shape
 
         # pylint: disable=line-too-long
-        #self.a_scorer = AnaphoricityScorer(pair_emb, self.config).to(self.config.device)
-        self.a_scorer_chunk = AnaphoricityScorerChunk(pair_emb_chunk, self.config).to(self.config.device)
+        self.a_scorer = AnaphoricityScorer(pair_emb, self.config).to(self.config.device)
+        #self.a_scorer_chunk = AnaphoricityScorerChunk(pair_emb_chunk, self.config).to(self.config.device)
         self.we = WordEncoder(bert_emb, self.config).to(self.config.device)
-        #self.rough_scorer = RoughScorer(bert_emb, self.config).to(self.config.device)
+        self.rough_scorer = RoughScorer(bert_emb, self.config).to(self.config.device)
         #self.rough_scorer_chunk = RoughScorerChunk(bert_emb*3+self.chunk_aux.shape, self.config).to(self.config.device)
-        self.rough_scorer_chunk = RoughScorerChunk(bert_emb, self.config).to(self.config.device)
-        #self.sp = SpanPredictor(bert_emb, self.config.sp_embedding_size).to(self.config.device)
+        self.sp = SpanPredictor(bert_emb, self.config.sp_embedding_size).to(self.config.device)
         #self.sp_chunk = SpanPredictorChunk(bert_emb*3+self.chunk_aux.shape, self.config.sp_embedding_size).to(self.config.device)
-        self.sp_chunk = SpanPredictorChunk(bert_emb, self.config.sp_embedding_size).to(self.config.device)
 
-        """self.trainable: Dict[str, torch.nn.Module] = {
+        self.trainable: Dict[str, torch.nn.Module] = {
             "bert": self.bert, "we": self.we,
             "rough_scorer": self.rough_scorer,
             "pw": self.pw, "a_scorer": self.a_scorer,
             "sp": self.sp
-        }"""
-        self.trainable: Dict[str, torch.nn.Module] = {
+        }
+        """self.trainable: Dict[str, torch.nn.Module] = {
             "bert": self.bert, "we": self.we,
             "rough_scorer_chunk": self.rough_scorer_chunk,
             "pw_chunk": self.pw_chunk, "a_scorer_chunk": self.a_scorer_chunk,
             #"sp": self.sp,
             "sp_chunk": self.sp_chunk, 
-            #"chunk_aux": self.chunk_aux
-        }
+            "chunk_aux": self.chunk_aux
+        }"""
 
     def _build_optimizers(self):
         n_docs = len(self._get_docs(self.config.train_data))
@@ -805,8 +765,6 @@ class CorefModel:  # pylint: disable=too-many-instance-attributes
                     chunk_text = [c.lower() for c in chunk_text]
                     temp_split = []
                     is_splitted = False
-                    if chunk_text == "\'s":
-                        print()
                     for pronoun in special_pronoun_list:
                         if pronoun in chunk_text:
                             for i, e in enumerate(chunk_text):
